@@ -1,163 +1,157 @@
-# Telegram Message Transfer Tool v2.7
+# Telegram Restricted Content Migrator
 
-A powerful, asynchronous Python script designed to transfer messages, photos, and videos between Telegram chats, channels, or forum topics. It supports bulk transfers via message ID ranges, handles media albums (grouped media) correctly, and can bypass forwarding restrictions by downloading and re-uploading content.
+A queue-based Telegram migration tool for moving large batches of channel media without running one giant fragile loop. It separates scanning, processing, and verification, stores all jobs in SQLite, uses one global Telegram API limiter, handles `FloodWait`, supports album jobs, and can upload to your destination through a bot account.
 
----
+Use it only for content you are allowed to access and migrate.
 
-## 🚀 Features
+## What Changed
 
-* **Bulk Transfer:** Move large volumes of messages using a specified ID range (e.g., `1-5000`).
-* **Media Support:** Handles Photos, Videos, and Text with granular toggles.
-* **Album Awareness:** Correctly detects and maintains the structure of media groups (albums).
-* **Topic Support:** Transfer content to and from specific forum topics using the `chat_id:topic_id` format.
-* **Bypass Restrictions:** Automatically switches to "Download & Upload" if a source channel restricts forwarding.
-* **Session Management:** Supports multiple Telegram accounts with an easy-to-use login interface.
-* **Local Backup:** Optional feature to save all transferred media to your local drive.
+- SQLite queue in `data/migration.sqlite3`
+- resumable `messages` table with `pending`, `downloading`, `uploading`, `copied`, `failed`, and `skipped` states
+- separate phases: scan source IDs, process pending jobs, verify destination posts
+- one shared rate limiter for Telegram calls
+- `FloodWait` sleeps for Telegram's wait plus extra random padding
+- batch processing with long pauses between batches
+- album/media group detection and one queue job per album
+- optional bot upload mode: user session reads, bot session posts
+- retry backoff with a maximum attempt count
+- controlled download cleanup under `downloads/active`, `downloads/failed`, and `downloads/completed`
+- graceful Ctrl+C handling
 
----
-
-## 🛠 Installation
-
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/xNabil/Telegram-Save-Restricted-Content.git
-cd Telegram-Save-Restricted-Content.git
-
-```
-
-### 2. Install Dependencies
-
-Ensure you have Python 3.8+ installed. Install the required libraries using `pip`:
+## Install
 
 ```bash
 pip install -r requirements.txt
-
 ```
 
-### 3. Configure Environment Variables
+Create or edit `config.yaml`. Secrets can be placed directly in YAML, but using `.env` is cleaner:
 
-Create a `.env` file in the root directory (or edit the existing one) with your Telegram API credentials and transfer settings.
+```env
+API_ID=123456
+API_HASH=your_api_hash
+BOT_TOKEN=123456:your_bot_token
+```
 
-**Required Settings:**
+The app reads `.env`, then expands values like `${API_ID}` in `config.yaml`.
 
-* `API_ID`: Your Telegram API ID from [my.telegram.org](https://my.telegram.org).
-* `API_HASH`: Your Telegram API Hash.
-* `SOURCES`: Comma-separated list of source IDs or usernames (e.g., `-100123,@source`).
-* `DESTINATIONS`: Comma-separated list of destination IDs or usernames.
+## Configure
 
----
+Important fields in `config.yaml`:
 
-## ⚙️ Configuration (.env)
+```yaml
+telegram:
+  user_session: "tnabil"
+  bot:
+    enabled: true
+    token: "${BOT_TOKEN}"
+    use_for_uploads: true
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `PHOTOS` | Transfer photo messages. | `True` |
-| `VIDEOS` | Transfer video messages. | `True` |
-| `TEXT` | Transfer text-only messages. | `True` |
-| `HIDE_SENDER` | If `True`, uses "Copy" instead of "Forward" to hide the original author. | `True` |
-| `DROP_CAPTION` | Remove captions from media during transfer. | `False` |
-| `SAVE_TO_LOCAL` | Save a copy of all media to the `/downloads` folder. | `False` |
-| `FORWARDING` | Attempt to use Telegram's native forwarding (faster). | `True` |
+migration:
+  sources:
+    - chat: "@source_channel_or_-100_id"
+      message_range:
+        start: 1
+        end: 2000
+  destinations:
+    - chat: "@destination_channel_or_-100_id"
 
----
+limits:
+  read_delay_seconds: 2
+  download_delay_seconds: 5
+  upload_delay_seconds: 30
 
-## 📖 Usage
+batch:
+  size: 25
+  pause_between_batches_seconds: 1800
+```
 
-### 1. Start the Script
+Set the bot as an admin in your destination channel when `telegram.bot.use_for_uploads` is enabled. The user session still reads the source because bots often cannot access old source history.
 
-Run the main script:
+## Commands
+
+Create a user session:
 
 ```bash
-python bot.py
-
+python main.py login --session tnabil
 ```
 
-### 2. Login
+Scan source message IDs into SQLite:
 
-Choose **Option 1** to log in. You will be prompted for your phone number and the verification code sent via Telegram. If 2FA is enabled, you will also be asked for your password. This creates a `.session` file in the `/sessions` folder.
+```bash
+python main.py scan
+```
 
-### 3. Run a Transfer
+Process pending jobs in configured batches:
 
-Choose **Option 2** and select your saved account. The script will:
+```bash
+python main.py process
+```
 
-1. Resolve your source and destination chats.
-2. Ask for a **Message ID Range** (e.g., `500-1000`).
-3. Process and transfer the messages in batches.
+Verify copied destination messages:
 
-> **Note:** If you are transferring to or from a Forum Topic, use the format `chat_id:topic_id` in your `.env` file.
+```bash
+python main.py verify
+```
 
----
-## 📂 How to Find Telegram IDs & Topic IDs
+Run scan and process sequentially:
 
-To fill out your `.env` file correctly, you need the unique identifiers for your chats.
+```bash
+python main.py run
+```
 
-### Finding Chat IDs
+Show queue counts:
 
-* 
-**Usernames:** You can use public handles like `@channelname` or `@username`.
+```bash
+python main.py stats
+```
 
+Recover jobs that were left as `downloading` or `uploading` after a crash:
 
-* **Private Chat IDs:** Use a bot like `@MissRose_bot` or `@IDBot`. Forward a message from the source to the bot, and it will return the ID (usually starting with `-100`).
+```bash
+python main.py recover
+```
 
+`python bot.py ...` still works as a wrapper around `main.py`.
 
+## Project Structure
 
-### Finding Topic IDs (For Forums)
+```text
+app/
+  config.py
+  db.py
+  telegram_client.py
+  scanner.py
+  queue.py
+  worker.py
+  upload.py
+  errors.py
+  logging.py
+data/
+  migration.sqlite3
+downloads/
+  active/
+  failed/
+  completed/
+config.yaml
+main.py
+```
 
-* 
-**Right-Click Method:** On Telegram Desktop, right-click a message within the specific topic and select "Copy Post Link." 
+## Queue Behavior
 
+The `messages` table stores:
 
-* **Link Structure:** The link will look like `https://t.me/c/123456789/5/100`. In this example:
-* `123456789` is the Chat ID.
-* 
-`5` is the **Topic ID** (the number you need for the `SOURCES` or `DESTINATIONS` field).
+- `source_chat_id`
+- `source_message_id`
+- `dest_chat_id`
+- `status`
+- `attempts`
+- `last_error`
+- `next_retry_at`
+- `file_unique_key`
+- `created_at`
+- `updated_at`
 
----
+Extra columns keep album IDs, source message ID lists, destination message IDs, and verification timestamps.
 
-## 🛠 Troubleshooting Common Issues
+Retries use `queue.retry_backoff_seconds`; after `queue.max_attempts`, repeated failures become `failed`. Filtered messages become `skipped` when `queue.record_skipped` is true.
 
-| Issue | Solution |
-| --- | --- |
-| **"FloodWait" Error** | You are sending requests too fast. The script will automatically pause for the required time to avoid a ban.
-
- |
-| **"CHAT_FORWARDS_RESTRICTED"** | The source channel has disabled forwarding. Ensure `HIDE_SENDER=True` and `FORWARDING_ONLY=False` so the script can download and re-upload the media instead.
-
- |
-| **"MEDIA_EMPTY"** | Usually occurs if the source message was deleted during the transfer or if the session lacks permission to view the media.
-
- |
-| **Missing Messages** | Ensure you are a member of both the source and destination chats before starting the transfer.
-
- |
-
----
-
-## 💡 Pro-Tips for Large Transfers
-
-* 
-**Batching:** The script processes messages in batches of 200 to maintain stability.
-
-
-* 
-**Safety Delays:** Random sleep intervals (1.0 to 2.5 seconds) are built-in between messages to mimic human behavior and protect your account.
-
-
-* 
-**Local Backups:** Set `SAVE_TO_LOCAL=True` if you want to keep a hard copy of every file transferred on your computer.
-
-
-
-## 📂 Project Structure
-
-* `bot.py`: The main application logic.
-* `sessions/`: Stores your encrypted Telegram session files and `accounts.json` cache.
-* `downloads/`: Local storage for media if `SAVE_TO_LOCAL` is enabled.
-* `requirements.txt`: List of Python dependencies (Pyrogram, Colorama, Tqdm, etc.).
-
----
-
-## ⚠️ Disclaimer
-
-This tool is for personal use and backup purposes. Please ensure you comply with Telegram's Terms of Service and respect the copyright of the content you are transferring.
