@@ -366,6 +366,16 @@ class Database:
             (limit,),
         )
 
+    def oversized_jobs(self) -> list[sqlite3.Row]:
+        return self.query(
+            """
+            SELECT *
+            FROM messages
+            WHERE reason_code = 'oversized'
+            ORDER BY source_chat_id ASC, source_message_id ASC, id ASC
+            """
+        )
+
     def counts_by_status(self) -> dict[str, int]:
         rows = self.query("SELECT status, COUNT(*) AS count FROM messages GROUP BY status")
         return {str(row["status"]): int(row["count"]) for row in rows}

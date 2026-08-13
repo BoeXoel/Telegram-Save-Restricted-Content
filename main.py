@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 from app.config import AppConfig, load_config
 from app.db import Database
 from app.logging import setup_logging
 from app.offload import RemoteOffloader
 from app.queue import MessageQueue
+from app.report import build_oversized_report
 from app.scanner import Scanner
 from app.storage import DownloadStorage, format_bytes
 from app.telegram_client import (
@@ -28,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Queue-based Telegram migration tool")
     parser.add_argument(
         "command",
-        choices=("login", "scan", "process", "verify", "run", "stats", "recover"),
+        choices=("login", "scan", "process", "verify", "run", "stats", "recover", "report-oversized"),
         help="Phase to run",
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
@@ -38,6 +40,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Process only known oversized jobs (valid with the process command)",
     )
+    parser.add_argument("--csv", help="Write report-oversized rows to this CSV file")
     return parser.parse_args()
 
 
@@ -51,22 +54,6 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
     db.initialize()
     queue = MessageQueue(db, config)
     offloader = RemoteOffloader(config.transfer.oversized, db, logger=logger)
-    storage = DownloadStorage(config.downloads)
-    removed_active = storage.cleanup_active_jobs()
-    removed_failed = storage.prune_failed_jobs()
-    disk = storage.summary()
-    logger.info(
-        "Disk summary: free=%s min_free=%s failed=%s",
-        format_bytes(disk.free_bytes),
-        format_bytes(disk.min_free_bytes),
-        format_bytes(disk.failed_bytes),
-    )
-    if removed_active or removed_failed:
-        logger.info(
-            "Removed stale managed download directories: active=%s failed=%s",
-            removed_active,
-            removed_failed,
-        )
 
     try:
         if command == "stats":
@@ -76,6 +63,27 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
             recovered = queue.recover_in_progress()
             print(f"Recovered {recovered} in-progress jobs to pending")
             return
+        if command == "report-oversized":
+            report = build_oversized_report(db)
+            report.print()
+            return
+
+        storage = DownloadStorage(config.downloads)
+        removed_active = storage.cleanup_active_jobs()
+        removed_failed = storage.prune_failed_jobs()
+        disk = storage.summary()
+        logger.info(
+            "Disk summary: free=%s min_free=%s failed=%s",
+            format_bytes(disk.free_bytes),
+            format_bytes(disk.min_free_bytes),
+            format_bytes(disk.failed_bytes),
+        )
+        if removed_active or removed_failed:
+            logger.info(
+                "Removed stale managed download directories: active=%s failed=%s",
+                removed_active,
+                removed_failed,
+            )
 
         async with AsyncExitStack() as stack:
             reader = make_user_client(config)
@@ -149,6 +157,8 @@ async def async_main() -> None:
     args = parse_args()
     if args.oversized_only and args.command != "process":
         raise ValueError("--oversized-only can only be used with the process command")
+    if args.csv and args.command != "report-oversized":
+        raise ValueError("--csv can only be used with the report-oversized command")
     config = load_config(args.config)
     config.ensure_directories()
 
@@ -156,7 +166,24 @@ async def async_main() -> None:
         await interactive_login(config, args.session)
         return
 
+    if args.command == "report-oversized" and args.csv:
+        await write_oversized_csv(config, args.csv)
+        return
+
     await run_with_clients(config, args.command, oversized_only=args.oversized_only)
+
+
+async def write_oversized_csv(config: AppConfig, csv_path: str) -> None:
+    db = Database(config.queue.db_path)
+    db.initialize()
+    try:
+        report = build_oversized_report(db)
+        report.print()
+        destination = (config.base_dir / csv_path).resolve() if not Path(csv_path).is_absolute() else Path(csv_path)
+        report.write_csv(destination)
+        print(f"Wrote {len(report.rows)} oversized report rows to {destination}")
+    finally:
+        db.close()
 
 
 def main() -> None:
