@@ -1,7 +1,8 @@
 telegram:
   api_id: "${API_ID}"
   api_hash: "${API_HASH}"
-  user_session: "tnabil"
+  # Use the same private name with: python main.py login --session my_user
+  user_session: "my_user"
   sessions_dir: "sessions"
   load_dialogs_on_start: false
 
@@ -14,14 +15,17 @@ telegram:
 migration:
   sources:
     - chat: "@source_channel_or_-100_id"
-      topic_id:
+      # Optional metadata for the source forum topic. Scanning still follows
+      # the message range below, so choose that range within the topic.
+      topic_id: null
       message_range:
         start: 1
         end: 2000
 
   destinations:
     - chat: "@destination_channel_or_-100_id"
-      topic_id:
+      # Optional forum-topic root message ID for delivery.
+      topic_id: null
 
 transfer:
   include:
@@ -30,12 +34,16 @@ transfer:
     text: true
     documents: false
 
+  # A native copy hides visible source attribution; false prefers forwarding.
   hide_sender: true
+  # Remove captions from selected media when copying, forwarding, or re-uploading.
   drop_caption: false
+  # Keep successful local download/upload job directories in downloads/completed/.
   save_to_local: false
   # 0 uses the sending account's Telegram limit: 2,000 MiB for bots and
   # ordinary users, 4,000 MiB for Premium users.
   max_upload_bytes: 0
+  # Bot-only override used when max_upload_bytes is 0 (2,000 MiB by default).
   max_bot_upload_bytes: 2097152000
   # Unknown-size media is recorded as skipped instead of being downloaded.
   allow_download_unknown_size: false
@@ -44,7 +52,9 @@ transfer:
   allow_premium_user_fallback: false
 
   native_copy:
+    # Direct Telegram copy/forward only works when the reader also writes.
     enabled: true
+    # true skips a job if direct copy/forward is unavailable; false re-uploads it.
     only: false
 
   # Files above Telegram's sending limit are normally only recorded.  Set

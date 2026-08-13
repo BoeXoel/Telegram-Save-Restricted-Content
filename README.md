@@ -11,7 +11,7 @@ It is deliberately a Telegram migration tool, not a general-purpose cloud sync s
 - `transfer.include.text: false` skips text-only messages but does not remove captions from selected media.
 - Native Telegram copy/forward is tried first whenever the same user account reads and writes. This avoids downloading and does not use local disk space.
 - Optional keyword and regular-expression filters inspect text bodies and media captions. A matching message, or any matching item in an album, skips the whole item.
-- Sources and destinations can point to forum topics.
+- Destinations can point to forum topics. A source `topic_id` is retained as queue metadata, but scanning deliberately follows the configured message-ID range; it is not a source-topic filter.
 
 Use it only for content that you have permission to access and migrate.
 
@@ -36,12 +36,29 @@ WEBDAV_PASSWORD=archive-password
 
 The app expands `${NAME}` values in `config.yaml`. Session files, `.env`, the queue database, and downloads are ignored by Git.
 
+## Quick start
+
+1. Set `telegram.user_session` to a private name such as `my_user`, then replace the source, destination, and small test range in `config.yaml`.
+2. If you want bot uploads, put `BOT_TOKEN` in `.env` and make the bot an administrator of the destination. Otherwise set `telegram.bot.enabled: false`.
+3. Create the user session interactively. The `--session` value must match `telegram.user_session`.
+4. Scan the small range, inspect the queue, then process it. Verify only after the destination result looks correct.
+
+```bash
+python main.py login --session my_user
+python main.py scan
+python main.py stats
+python main.py process
+python main.py verify
+```
+
+Every command accepts `--config PATH` when the configuration is not the `config.yaml` in the current directory. Start with a small range and a non-critical destination before increasing the range.
+
 ## Login, including two-factor authentication
 
 Create the user session interactively before scheduling anything:
 
 ```bash
-python main.py login --session my_user
+python main.py login --config config.yaml --session my_user
 ```
 
 If Telegram requests two-factor authentication, the password prompt is hidden and the password is never written to logs. Login must remain interactive; do not put the password into YAML, `.env`, or a service file.
@@ -71,6 +88,28 @@ transfer:
 ```
 
 When a bot uploads, make it an administrator of the destination. The user session is still used to read the source because bots often cannot read old history.
+
+### Delivery choices
+
+The `transfer` settings below decide whether Telegram can copy a message directly or the tool needs to download and upload it again:
+
+```yaml
+transfer:
+  # A native copy removes the visible source attribution. Set false to forward
+  # when Telegram permits it.
+  hide_sender: true
+  # Remove a media caption or text attached to a copied/forwarded media item.
+  drop_caption: false
+  native_copy:
+    enabled: true
+    # true means skip a job when Telegram cannot copy/forward it directly;
+    # false permits the normal local download-and-upload fallback.
+    only: false
+  # Retain successful locally downloaded job directories in downloads/completed/.
+  save_to_local: false
+```
+
+Native copy/forward is available only when the same user account reads and writes, and Telegram permits the operation. With `hide_sender: true`, that native path uses copy rather than forward. When a bot writes, or native copy is unavailable, selected media uses the local download-and-upload path unless `native_copy.only` is enabled. `save_to_local` has the same successful-download retention effect as `downloads.keep_completed`; it does not create files for native copies, and remote oversized files follow their separate `delete_local_after` setting.
 
 ### Telegram file-size limits
 
@@ -214,6 +253,12 @@ Here `456` is the `topic_id`; it is the number before the final message ID. The 
 ## Commands
 
 ```bash
+# Show every command and option. Add --config /path/to/config.yaml to any command.
+python main.py --help
+
+# Create or refresh the interactive user session.
+python main.py login --session my_user
+
 # Scan the configured ranges into SQLite.
 python main.py scan
 
@@ -229,7 +274,14 @@ python main.py run
 # Show state counts, or recover rows left in a transfer phase after a crash.
 python main.py stats
 python main.py recover
+
+# Process only pending rows already marked as oversized, or inspect/export them.
+python main.py process --oversized-only
+python main.py report-oversized
+python main.py report-oversized --csv oversized.csv
 ```
+
+`python bot.py ...` remains a compatibility wrapper for `python main.py ...`; new scripts should use `main.py`.
 
 Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and `skipped`. Extra reason codes distinguish cases such as `oversized`, `unknown_size`, `disk_low`, `disk_full`, `flood_wait`, `account_restricted`, `source_missing`, `permission_denied`, `topic_error`, and `ad_filtered`.
 
