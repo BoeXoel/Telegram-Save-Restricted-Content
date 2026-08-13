@@ -20,8 +20,15 @@ from pyrogram.types import InputMediaDocument, InputMediaPhoto, InputMediaVideo,
 
 from app.config import AppConfig
 from app.errors import PermanentJobError, RetryableJobError
+from app.filters import ContentFilter, FilterMatch
 from app.queue import MessageJob
-from app.telegram_client import TelegramLimiter, message_file_size, message_is_empty, message_media_type
+from app.telegram_client import (
+    TelegramLimiter,
+    message_caption,
+    message_file_size,
+    message_is_empty,
+    message_media_type,
+)
 
 
 PhaseCallback = Callable[[str], Awaitable[None]]
@@ -32,6 +39,7 @@ class UploadResult:
     status: str
     dest_message_ids: list[int] = field(default_factory=list)
     reason: str = ""
+    reason_code: str | None = None
 
 
 class Uploader:
@@ -48,6 +56,7 @@ class Uploader:
         self.writer = writer
         self.limiter = limiter
         self.logger = logger
+        self.content_filter = ContentFilter(config.filters)
 
     async def process(
         self,
@@ -56,10 +65,21 @@ class Uploader:
         on_phase: PhaseCallback,
     ) -> UploadResult:
         messages = await self._load_source_messages(job)
+        filter_match = self._filter_match(messages)
+        if filter_match:
+            return UploadResult(
+                status="skipped",
+                reason=filter_match.reason,
+                reason_code=filter_match.reason_code,
+            )
         messages = [msg for msg in messages if self._message_should_process(msg)]
 
         if not messages:
-            return UploadResult(status="skipped", reason="Source messages missing or filtered out")
+            return UploadResult(
+                status="skipped",
+                reason="Source messages missing or filtered out",
+                reason_code="source_missing",
+            )
 
         text_only = all(message_media_type(message) == "text" for message in messages)
 
@@ -300,6 +320,9 @@ class Uploader:
         if media_type == "text":
             return self.config.transfer.include_text
         return False
+
+    def _filter_match(self, messages: list[Message]) -> FilterMatch | None:
+        return self.content_filter.match_texts(message_caption(message) for message in messages)
 
     def _validate_bot_upload_size(self, message: Message) -> None:
         if self.writer is self.reader:

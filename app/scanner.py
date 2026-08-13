@@ -8,6 +8,7 @@ from pyrogram import Client
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
+from app.filters import ContentFilter, FilterMatch
 from app.queue import MessageQueue
 from app.telegram_client import (
     ResolvedChat,
@@ -37,6 +38,7 @@ class Scanner:
         self.writer = writer
         self.limiter = limiter
         self.logger = logger
+        self.content_filter = ContentFilter(config.filters)
 
     async def scan(self, stop_event: asyncio.Event) -> None:
         destinations = await self._resolve_destinations()
@@ -109,9 +111,10 @@ class Scanner:
 
         for group in grouped:
             first = group[0]
-            processable = self._group_should_process(group)
+            filter_match = self._filter_match(group)
+            processable = self._group_should_process(group) and filter_match is None
             status = "pending" if processable else "skipped"
-            if not processable and not self.config.queue.record_skipped:
+            if status == "skipped" and not self.config.queue.record_skipped:
                 continue
 
             unique_key = self._group_unique_key(resolved_source.chat_id, group)
@@ -136,7 +139,8 @@ class Scanner:
                     file_size=file_size,
                     caption=caption,
                     status=status,
-                    last_error=None if processable else "Filtered out by config",
+                    last_error=self._skip_reason(filter_match, group) if not processable else None,
+                    reason_code=filter_match.reason_code if filter_match else None,
                 )
                 if inserted and status == "pending":
                     added += 1
@@ -157,6 +161,16 @@ class Scanner:
 
     def _group_should_process(self, messages: list[Message]) -> bool:
         return any(self._message_should_process(message) for message in messages)
+
+    def _filter_match(self, messages: list[Message]) -> FilterMatch | None:
+        return self.content_filter.match_texts(message_caption(message) for message in messages)
+
+    def _skip_reason(self, filter_match: FilterMatch | None, messages: list[Message]) -> str:
+        if filter_match:
+            return filter_match.reason
+        if not self._group_should_process(messages):
+            return "Skipped because its message type is disabled by configuration"
+        return "Skipped by configuration"
 
     def _message_should_process(self, message: Message) -> bool:
         media_type = message_media_type(message)
@@ -182,4 +196,3 @@ class Scanner:
         if keys:
             return "album:" + "|".join(keys) if len(keys) > 1 else keys[0]
         return "messages:" + source_chat_id + ":" + ",".join(str(message.id) for message in messages)
-

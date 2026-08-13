@@ -104,6 +104,14 @@ class TransferConfig:
 
 
 @dataclass(frozen=True)
+class ContentFilterConfig:
+    enabled: bool
+    case_sensitive: bool
+    keywords: tuple[str, ...]
+    regex: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class QueueConfig:
     db_path: Path
     max_attempts: int
@@ -163,6 +171,7 @@ class AppConfig:
     base_dir: Path
     telegram: TelegramConfig
     transfer: TransferConfig
+    filters: ContentFilterConfig
     queue: QueueConfig
     limits: LimitsConfig
     batch: BatchConfig
@@ -196,6 +205,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
 
     telegram = raw.get("telegram", {})
     transfer = raw.get("transfer", {})
+    filters = raw.get("filters", {})
     queue = raw.get("queue", {})
     limits = raw.get("limits", {})
     batch = raw.get("batch", {})
@@ -243,6 +253,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             save_to_local=_as_bool(transfer.get("save_to_local"), False),
             max_bot_upload_bytes=int(transfer.get("max_bot_upload_bytes", 2_000 * 1024 * 1024)),
         ),
+        filters=_load_content_filters(filters),
         queue=QueueConfig(
             db_path=_path(base_dir, str(queue.get("db_path", "data/migration.sqlite3"))),
             max_attempts=int(queue.get("max_attempts", 4)),
@@ -282,3 +293,42 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         destinations=[ChatSpec.from_config(item) for item in migration.get("destinations", [])],
     )
 
+
+def _load_content_filters(raw: Any) -> ContentFilterConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("filters must be a mapping")
+
+    case_sensitive = _as_bool(raw.get("case_sensitive"), False)
+    keywords = _string_tuple(raw.get("keywords"), "filters.keywords")
+    regex = _string_tuple(raw.get("regex"), "filters.regex")
+    flags = 0 if case_sensitive else re.IGNORECASE
+    for index, pattern in enumerate(regex, start=1):
+        try:
+            re.compile(pattern, flags)
+        except re.error as exc:
+            raise ValueError(f"filters.regex rule #{index} is invalid: {exc}") from exc
+
+    return ContentFilterConfig(
+        enabled=_as_bool(raw.get("enabled"), False),
+        case_sensitive=case_sensitive,
+        keywords=keywords,
+        regex=regex,
+    )
+
+
+def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    result: list[str] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} rule #{index} must be a string")
+        if item:
+            result.append(item)
+    return tuple(result)

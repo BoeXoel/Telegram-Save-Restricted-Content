@@ -39,6 +39,14 @@ transfer:
     enabled: true
     only: false
 
+# Disabled by default.  When enabled, a matching text message or media caption
+# skips the entire message or album.  Matched text is never written to logs.
+filters:
+  enabled: false
+  case_sensitive: false
+  keywords: []
+  regex: []
+
 queue:
   db_path: "data/migration.sqlite3"
   max_attempts: 4
@@ -76,4 +84,3 @@ downloads:
 logging:
   level: "INFO"
   file: "data/migration.log"
-

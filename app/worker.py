@@ -71,7 +71,7 @@ class Worker:
                 if self.logger:
                     self.logger.info("Job %s copied to %s", job.id, result.dest_message_ids or "destination")
             elif result.status == "skipped":
-                self.queue.mark_skipped(job.id, result.reason)
+                self.queue.mark_skipped(job.id, result.reason, reason_code=result.reason_code)
                 if self.logger:
                     self.logger.info("Job %s skipped: %s", job.id, result.reason)
             else:
