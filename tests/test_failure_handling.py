@@ -8,6 +8,7 @@ from pyrogram.errors import MessageIdInvalid, PeerFlood
 
 from app.errors import FloodWaitDeferred
 from app.telegram_client import TelegramLimiter
+from app.upload import UploadResult
 from app.worker import Worker
 
 
@@ -49,11 +50,22 @@ class WorkerFailureClassificationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(queue.skipped[0]["reason_code"], "source_missing")
 
+    async def test_actual_fallback_writer_replaces_the_initial_writer_metadata(self) -> None:
+        queue = _RecordingQueue()
+        worker = Worker(_worker_config(), queue, _SuccessfulFallbackUploader())
+
+        await worker._process_one(_job(), _StopEvent())
+
+        self.assertEqual(queue.writer_records, [("bot:10", 100), ("premium_user:30", 200)])
+        self.assertEqual(queue.copied, [[99]])
+
 
 class _RecordingQueue:
     def __init__(self) -> None:
         self.deferred: dict[str, object] = {}
         self.skipped: list[dict[str, object]] = []
+        self.writer_records: list[tuple[str, int]] = []
+        self.copied: list[list[int]] = []
 
     def start_attempt(self, _job: object) -> int:
         return 1
@@ -64,6 +76,12 @@ class _RecordingQueue:
     def mark_skipped(self, _job_id: int, _error: str, **kwargs: object) -> None:
         self.skipped.append(kwargs)
 
+    def record_writer(self, _job_id: int, identity: str, upload_limit_bytes: int) -> None:
+        self.writer_records.append((identity, upload_limit_bytes))
+
+    def mark_copied(self, _job_id: int, dest_message_ids: list[int]) -> None:
+        self.copied.append(dest_message_ids)
+
 
 class _FailingUploader:
     writer_capabilities = None
@@ -73,6 +91,21 @@ class _FailingUploader:
 
     async def process(self, _job: object, _stop_event: object, _on_phase: object) -> object:
         raise self.error
+
+
+class _SuccessfulFallbackUploader:
+    writer_capabilities = SimpleNamespace(
+        identity="bot:10",
+        max_upload_bytes=100,
+    )
+
+    async def process(self, _job: object, _stop_event: object, _on_phase: object) -> UploadResult:
+        return UploadResult(
+            status="copied",
+            dest_message_ids=[99],
+            writer_identity="premium_user:30",
+            upload_limit_bytes=200,
+        )
 
 
 class _StopEvent:

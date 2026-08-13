@@ -72,6 +72,7 @@ class ContentFilterTests(unittest.TestCase):
             self.assertFalse(config.filters.enabled)
             self.assertFalse(config.filters.case_sensitive)
             self.assertEqual(config.filters.keywords, ())
+            self.assertFalse(config.transfer.allow_premium_user_fallback)
 
             config_path.write_text(
                 "telegram:\n"

@@ -38,6 +38,7 @@ class WriterCapabilities:
     account_type: str
     is_premium: bool
     max_upload_bytes: int
+    account_id: int | str = "unknown"
 
 
 def get_writer_capabilities(config: AppConfig, account: Any) -> WriterCapabilities:
@@ -60,6 +61,7 @@ def get_writer_capabilities(config: AppConfig, account: Any) -> WriterCapabiliti
         account_type=account_type,
         is_premium=is_premium,
         max_upload_bytes=limit,
+        account_id=account_id,
     )
 
 

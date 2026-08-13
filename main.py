@@ -91,6 +91,7 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
             me = await limiter.call("read", reader.get_me)
             update_account_cache(config, config.telegram.user_session, me)
             logger.info("Reader session: %s (%s)", me.first_name, me.id)
+            reader_capabilities = get_writer_capabilities(config, me)
 
             bot = make_bot_client(config)
             writer = reader
@@ -108,6 +109,25 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
                 writer_capabilities.identity,
                 writer_capabilities.max_upload_bytes // (1024 * 1024),
             )
+
+            fallback_writer = None
+            fallback_writer_capabilities = None
+            if (
+                config.transfer.allow_premium_user_fallback
+                and writer is not reader
+                and writer_capabilities.account_type == "bot"
+                and reader_capabilities.account_type == "premium_user"
+                and reader_capabilities.max_upload_bytes > writer_capabilities.max_upload_bytes
+            ):
+                fallback_writer = reader
+                fallback_writer_capabilities = reader_capabilities
+                logger.info(
+                    "Premium reader fallback is enabled; it will be used only after a destination permission check"
+                )
+            elif config.transfer.allow_premium_user_fallback:
+                logger.warning(
+                    "Premium reader fallback is enabled but no eligible Premium reader/bot combination is active"
+                )
 
             if config.telegram.load_dialogs_on_start:
                 logger.info("Dialog cache warmup skipped; chats are resolved directly through the limiter")
@@ -132,6 +152,8 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
                     limiter,
                     logger=logger,
                     writer_capabilities=writer_capabilities,
+                    fallback_writer=fallback_writer,
+                    fallback_writer_capabilities=fallback_writer_capabilities,
                     storage=storage,
                     offloader=offloader,
                 )

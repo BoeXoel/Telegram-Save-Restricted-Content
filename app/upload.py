@@ -5,7 +5,7 @@ import errno
 import random
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -54,6 +54,8 @@ class UploadResult:
     reason_code: str | None = None
     transfer_route: str | None = None
     remote_uri: str | None = None
+    writer_identity: str | None = None
+    upload_limit_bytes: int | None = None
 
 
 class Uploader:
@@ -65,6 +67,8 @@ class Uploader:
         limiter: TelegramLimiter,
         logger: Any | None = None,
         writer_capabilities: WriterCapabilities | None = None,
+        fallback_writer: Client | None = None,
+        fallback_writer_capabilities: WriterCapabilities | None = None,
         storage: DownloadStorage | None = None,
         offloader: RemoteOffloader | None = None,
     ) -> None:
@@ -74,6 +78,8 @@ class Uploader:
         self.limiter = limiter
         self.logger = logger
         self.writer_capabilities = writer_capabilities
+        self.fallback_writer = fallback_writer
+        self.fallback_writer_capabilities = fallback_writer_capabilities
         self.storage = storage or DownloadStorage(config.downloads)
         self.offloader = offloader
         self.content_filter = ContentFilter(config.filters)
@@ -283,7 +289,10 @@ class Uploader:
         stop_event: asyncio.Event,
         on_phase: PhaseCallback,
     ) -> UploadResult:
-        validation_result = self._validate_downloadable_messages(job, messages)
+        local_writer, local_capabilities, validation_result = await self._select_local_writer(
+            job,
+            messages,
+        )
         if validation_result:
             if (
                 validation_result.reason_code == "oversized"
@@ -319,9 +328,9 @@ class Uploader:
                 raise RetryableJobError("Stop requested after download; leaving job for retry")
 
             await on_phase("uploading")
-            result = await self._upload_downloaded(job, downloaded)
+            result = await self._upload_downloaded(job, downloaded, writer=local_writer)
             success = True
-            return result
+            return self._with_writer_capabilities(result, local_capabilities)
         except DiskFullError:
             force_delete = True
             raise
@@ -488,6 +497,8 @@ class Uploader:
         self,
         job: MessageJob,
         downloaded: list[tuple[Message, Path]],
+        *,
+        writer: Client,
     ) -> UploadResult:
         kwargs = self._destination_kwargs(job)
 
@@ -516,12 +527,12 @@ class Uploader:
 
             result = await self.limiter.call(
                 "upload",
-                self.writer.send_media_group,
+                writer.send_media_group,
                 chat_id=job.dest_chat_id,
                 media=media_group,
                 **kwargs,
             )
-            await self._ensure_topic_delivery(job, result)
+            await self._ensure_topic_delivery(job, result, writer=writer)
             return UploadResult(
                 status="copied",
                 dest_message_ids=self._result_message_ids(result),
@@ -535,7 +546,7 @@ class Uploader:
         if media_type == "photo":
             result = await self.limiter.call(
                 "upload",
-                self.writer.send_photo,
+                writer.send_photo,
                 chat_id=job.dest_chat_id,
                 photo=str(path),
                 caption=caption,
@@ -545,7 +556,7 @@ class Uploader:
         elif media_type == "video":
             result = await self.limiter.call(
                 "upload",
-                self.writer.send_video,
+                writer.send_video,
                 chat_id=job.dest_chat_id,
                 video=str(path),
                 caption=caption,
@@ -556,7 +567,7 @@ class Uploader:
         elif media_type == "text":
             result = await self.limiter.call(
                 "upload",
-                self.writer.send_message,
+                writer.send_message,
                 chat_id=job.dest_chat_id,
                 text=message.text or message.caption or "",
                 entities=message.entities or message.caption_entities,
@@ -565,7 +576,7 @@ class Uploader:
         else:
             result = await self.limiter.call(
                 "upload",
-                self.writer.send_document,
+                writer.send_document,
                 chat_id=job.dest_chat_id,
                 document=str(path),
                 caption=caption,
@@ -573,7 +584,7 @@ class Uploader:
                 **kwargs,
             )
 
-        await self._ensure_topic_delivery(job, result)
+        await self._ensure_topic_delivery(job, result, writer=writer)
         return UploadResult(
             status="copied",
             dest_message_ids=self._result_message_ids(result),
@@ -585,20 +596,33 @@ class Uploader:
             return {"reply_to_message_id": job.dest_topic_id}
         return {}
 
-    async def _ensure_topic_delivery(self, job: MessageJob, result: Any) -> None:
+    async def _ensure_topic_delivery(
+        self,
+        job: MessageJob,
+        result: Any,
+        *,
+        writer: Client | None = None,
+    ) -> None:
         if not job.dest_topic_id:
             return
         messages = result if isinstance(result, list) else [result]
         message_ids = self._result_message_ids(result)
         if messages and all(self._message_is_in_topic(message, job.dest_topic_id) for message in messages):
             return
-        await self._cleanup_misplaced_messages(job, message_ids)
+        await self._cleanup_misplaced_messages(job, message_ids, writer=writer)
         raise TopicDeliveryError("Destination message did not arrive in the configured forum topic")
 
-    async def _cleanup_misplaced_messages(self, job: MessageJob, message_ids: list[int]) -> None:
+    async def _cleanup_misplaced_messages(
+        self,
+        job: MessageJob,
+        message_ids: list[int],
+        *,
+        writer: Client | None = None,
+    ) -> None:
         if not message_ids:
             return
-        delete_messages = getattr(self.writer, "delete_messages", None)
+        target_writer = writer if writer is not None else self.writer
+        delete_messages = getattr(target_writer, "delete_messages", None)
         if not callable(delete_messages):
             return
         try:
@@ -659,12 +683,135 @@ class Uploader:
     def _filter_match(self, messages: list[Message]) -> FilterMatch | None:
         return self.content_filter.match_texts(message_caption(message) for message in messages)
 
+    async def _select_local_writer(
+        self,
+        job: MessageJob,
+        messages: list[Message],
+    ) -> tuple[Client, WriterCapabilities | None, UploadResult | None]:
+        """Choose the account that will send locally downloaded media.
+
+        A Premium reader is never selected implicitly.  It may only replace a
+        bot after the user enabled the setting, the bot limit rejected the
+        source, and the reader was confirmed to be able to post to the target.
+        """
+
+        primary_identity, primary_limit = self._writer_upload_limit()
+        primary_validation = self._validate_downloadable_messages(
+            job,
+            messages,
+            identity=primary_identity,
+            limit=primary_limit,
+        )
+        if primary_validation is None:
+            return self.writer, self.writer_capabilities, None
+
+        if (
+            primary_validation.reason_code != "oversized"
+            or not self._premium_fallback_is_available()
+        ):
+            return self.writer, self.writer_capabilities, primary_validation
+
+        assert self.fallback_writer is not None
+        assert self.fallback_writer_capabilities is not None
+        fallback_capabilities = self.fallback_writer_capabilities
+        fallback_validation = self._validate_downloadable_messages(
+            job,
+            messages,
+            identity=fallback_capabilities.identity,
+            limit=fallback_capabilities.max_upload_bytes,
+        )
+        if fallback_validation is not None:
+            return self.writer, self.writer_capabilities, primary_validation
+
+        if not await self._fallback_writer_can_post(job):
+            if self.logger:
+                self.logger.info(
+                    "Premium writer fallback is unavailable for job %s because the reader cannot post to the destination",
+                    job.id,
+                )
+            return self.writer, self.writer_capabilities, primary_validation
+
+        if self.logger:
+            self.logger.info(
+                "Using the explicitly enabled Premium user writer fallback for job %s",
+                job.id,
+            )
+        return self.fallback_writer, fallback_capabilities, None
+
+    def _premium_fallback_is_available(self) -> bool:
+        primary = self.writer_capabilities
+        fallback = self.fallback_writer_capabilities
+        return bool(
+            getattr(self.config.transfer, "allow_premium_user_fallback", False)
+            and self.fallback_writer is not None
+            and primary is not None
+            and fallback is not None
+            and primary.account_type == "bot"
+            and fallback.account_type == "premium_user"
+            and fallback.max_upload_bytes > primary.max_upload_bytes
+            and isinstance(fallback.account_id, int)
+        )
+
+    async def _fallback_writer_can_post(self, job: MessageJob) -> bool:
+        """Preflight the explicitly chosen reader account without downloading."""
+
+        assert self.fallback_writer is not None
+        assert self.fallback_writer_capabilities is not None
+        get_chat = getattr(self.fallback_writer, "get_chat", None)
+        get_chat_member = getattr(self.fallback_writer, "get_chat_member", None)
+        if not callable(get_chat) or not callable(get_chat_member):
+            return False
+
+        try:
+            chat = await self.limiter.call("resolve", get_chat, job.dest_chat_id)
+            member = await self.limiter.call(
+                "resolve",
+                get_chat_member,
+                job.dest_chat_id,
+                self.fallback_writer_capabilities.account_id,
+            )
+        except (BadRequest, ChannelInvalid, ChannelPrivate, ChatWriteForbidden):
+            return False
+
+        status = str(getattr(member, "status", "")).lower()
+        if any(value in status for value in ("banned", "left", "restricted")):
+            return False
+
+        permissions = getattr(member, "permissions", None)
+        if getattr(permissions, "can_send_messages", None) is False:
+            return False
+        privileges = getattr(member, "privileges", None)
+        if getattr(privileges, "can_post_messages", None) is False:
+            return False
+
+        chat_type = str(getattr(chat, "type", "")).lower()
+        if "channel" in chat_type:
+            return any(value in status for value in ("owner", "creator", "administrator", "admin"))
+        return True
+
+    @staticmethod
+    def _with_writer_capabilities(
+        result: UploadResult,
+        capabilities: WriterCapabilities | None,
+    ) -> UploadResult:
+        if capabilities is None:
+            return result
+        return replace(
+            result,
+            writer_identity=capabilities.identity,
+            upload_limit_bytes=capabilities.max_upload_bytes,
+        )
+
     def _validate_downloadable_messages(
         self,
         job: MessageJob,
         messages: list[Message],
+        *,
+        identity: str | None = None,
+        limit: int | None = None,
     ) -> UploadResult | None:
-        identity, limit = self._writer_upload_limit()
+        if identity is None or limit is None:
+            identity, limit = self._writer_upload_limit()
         unknown_messages: list[Message] = []
         for message in messages:
             if message_media_type(message) == "text":

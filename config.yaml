@@ -39,6 +39,9 @@ transfer:
   max_bot_upload_bytes: 2097152000
   # Unknown-size media is recorded as skipped instead of being downloaded.
   allow_download_unknown_size: false
+  # Explicit opt-in only: a Premium reading account may post 2-4 GiB media
+  # when the configured bot cannot. The target permission is checked first.
+  allow_premium_user_fallback: false
 
   native_copy:
     enabled: true

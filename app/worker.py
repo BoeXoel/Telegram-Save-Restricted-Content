@@ -87,6 +87,12 @@ class Worker:
 
         try:
             result = await self.uploader.process(job, stop_event, set_phase)
+            if result.writer_identity and result.upload_limit_bytes is not None:
+                self.queue.record_writer(
+                    job.id,
+                    result.writer_identity,
+                    result.upload_limit_bytes,
+                )
             if result.status == "copied":
                 self.queue.mark_copied(job.id, result.dest_message_ids)
                 if self.logger:

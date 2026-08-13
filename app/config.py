@@ -103,6 +103,7 @@ class TransferConfig:
     max_bot_upload_bytes: int
     max_upload_bytes: int
     allow_download_unknown_size: bool
+    allow_premium_user_fallback: bool
     oversized: "OversizedConfig"
 
 
@@ -290,6 +291,10 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 "transfer.max_upload_bytes",
             ),
             allow_download_unknown_size=_as_bool(transfer.get("allow_download_unknown_size"), False),
+            allow_premium_user_fallback=_as_bool(
+                transfer.get("allow_premium_user_fallback"),
+                False,
+            ),
             oversized=_load_oversized_config(transfer.get("oversized")),
         ),
         filters=_load_content_filters(filters),

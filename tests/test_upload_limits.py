@@ -102,6 +102,68 @@ class LocalUploadLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((active_dir / "job-7").exists())
             self.assertFalse(message.download_called)
 
+    async def test_explicit_premium_fallback_uses_the_reader_after_permission_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_dir = Path(temp_dir) / "active"
+            message = _DownloadableMediaMessage(150)
+            reader = _PremiumFallbackReader([message], can_post=True)
+            uploader = _uploader(
+                active_dir,
+                [message],
+                limit=100,
+                reader=reader,
+                writer=_BotWriter(),
+                allow_premium_user_fallback=True,
+                fallback_writer=reader,
+                fallback_writer_capabilities=WriterCapabilities(
+                    identity="premium_user:30",
+                    account_type="premium_user",
+                    is_premium=True,
+                    max_upload_bytes=200,
+                    account_id=30,
+                ),
+            )
+
+            result = await uploader.process(_job(), _NeverSetEvent(), _allowed_phase)
+
+            self.assertEqual(result.status, "copied")
+            self.assertEqual(result.writer_identity, "premium_user:30")
+            self.assertEqual(result.upload_limit_bytes, 200)
+            self.assertTrue(message.download_called)
+            self.assertEqual(reader.checked_members, [("-1002", 30)])
+            self.assertEqual(len(reader.sent_photos), 1)
+            self.assertFalse((active_dir / "job-7").exists())
+
+    async def test_premium_fallback_does_not_download_when_target_is_not_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_dir = Path(temp_dir) / "active"
+            message = _DownloadableMediaMessage(150)
+            reader = _PremiumFallbackReader([message], can_post=False)
+            uploader = _uploader(
+                active_dir,
+                [message],
+                limit=100,
+                reader=reader,
+                writer=_BotWriter(),
+                allow_premium_user_fallback=True,
+                fallback_writer=reader,
+                fallback_writer_capabilities=WriterCapabilities(
+                    identity="premium_user:30",
+                    account_type="premium_user",
+                    is_premium=True,
+                    max_upload_bytes=200,
+                    account_id=30,
+                ),
+            )
+
+            result = await uploader.process(_job(), _NeverSetEvent(), _unexpected_phase)
+
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(result.reason_code, "oversized")
+            self.assertFalse(message.download_called)
+            self.assertEqual(reader.checked_members, [("-1002", 30)])
+            self.assertEqual(reader.sent_photos, [])
+
 
 class _MediaMessage:
     def __init__(self, size: int | None) -> None:
@@ -135,12 +197,50 @@ class _EnospcMediaMessage(_MediaMessage):
         raise OSError(errno.ENOSPC, "No space left on device")
 
 
+class _DownloadableMediaMessage(_MediaMessage):
+    async def download(self, **kwargs: object) -> str:
+        self.download_called = True
+        path = Path(str(kwargs["file_name"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        size = self.photo.file_size
+        path.write_bytes(b"x" * int(size))
+        return str(path)
+
+
 class _Reader:
     def __init__(self, messages: list[_MediaMessage]) -> None:
         self.messages = messages
 
     async def get_messages(self, _chat_id: str, _message_ids: list[int]) -> list[_MediaMessage]:
         return self.messages
+
+
+class _BotWriter:
+    async def send_photo(self, **_kwargs: object) -> object:
+        raise AssertionError("The bot must not upload through the Premium fallback path")
+
+
+class _PremiumFallbackReader(_Reader):
+    def __init__(self, messages: list[_MediaMessage], *, can_post: bool) -> None:
+        super().__init__(messages)
+        self.can_post = can_post
+        self.checked_members: list[tuple[str, int]] = []
+        self.sent_photos: list[dict[str, object]] = []
+
+    async def get_chat(self, _chat_id: str) -> object:
+        return SimpleNamespace(type="supergroup")
+
+    async def get_chat_member(self, chat_id: str, user_id: int) -> object:
+        self.checked_members.append((chat_id, user_id))
+        return SimpleNamespace(
+            status="member" if self.can_post else "restricted",
+            permissions=SimpleNamespace(can_send_messages=self.can_post),
+            privileges=None,
+        )
+
+    async def send_photo(self, **kwargs: object) -> object:
+        self.sent_photos.append(kwargs)
+        return SimpleNamespace(id=101)
 
 
 class _Limiter:
@@ -183,6 +283,11 @@ def _uploader(
     keep_failed: bool = False,
     max_failed_bytes: int = 0,
     storage: object | None = None,
+    reader: object | None = None,
+    writer: object | None = None,
+    allow_premium_user_fallback: bool = False,
+    fallback_writer: object | None = None,
+    fallback_writer_capabilities: WriterCapabilities | None = None,
 ) -> Uploader:
     config = SimpleNamespace(
         filters=ContentFilterConfig(enabled=False, case_sensitive=False, keywords=(), regex=()),
@@ -197,6 +302,7 @@ def _uploader(
             drop_caption=False,
             save_to_local=False,
             allow_download_unknown_size=False,
+            allow_premium_user_fallback=allow_premium_user_fallback,
             max_upload_bytes=0,
             max_bot_upload_bytes=limit,
         ),
@@ -214,8 +320,8 @@ def _uploader(
     )
     return Uploader(
         config,
-        _Reader(messages),
-        object(),
+        reader or _Reader(messages),
+        writer or object(),
         _Limiter(),
         writer_capabilities=WriterCapabilities(
             identity="bot:10",
@@ -223,6 +329,8 @@ def _uploader(
             is_premium=False,
             max_upload_bytes=limit,
         ),
+        fallback_writer=fallback_writer,
+        fallback_writer_capabilities=fallback_writer_capabilities,
         storage=storage,
     )
 

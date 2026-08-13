@@ -82,10 +82,13 @@ Local download-and-upload uses the account that actually sends the file:
 
 `transfer.max_upload_bytes: 0` uses that automatic choice. Set a positive value only when you intentionally need a stricter or test-only limit. Files above the limit are never downloaded merely to discover that Telegram cannot accept them. If the size is unavailable, the default is also safe: the job is recorded as `unknown_size` and no local download starts.
 
+When a Bot is the normal sender but the reading account is Premium, you can explicitly allow that Premium account to send files between the Bot and Premium limits. This is off by default and is not an automatic account rotation: before any download, the tool checks that the Premium account can post to the chosen destination. If it cannot, the file remains an oversized record (or follows the separately configured remote archive path).
+
 ```yaml
 transfer:
   max_upload_bytes: 0
   allow_download_unknown_size: false
+  allow_premium_user_fallback: false
 ```
 
 An existing server-side Telegram copy can still succeed for a large file, so the queue keeps known oversized candidates pending long enough to try that zero-download route first.
