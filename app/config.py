@@ -103,6 +103,29 @@ class TransferConfig:
     max_bot_upload_bytes: int
     max_upload_bytes: int
     allow_download_unknown_size: bool
+    oversized: "OversizedConfig"
+
+
+@dataclass(frozen=True)
+class OversizedRemoteConfig:
+    enabled: bool
+    method: str
+    dest: str
+    extra_args: tuple[str, ...]
+    delete_local_after: bool
+    webdav_username: str
+    webdav_password: str
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class OversizedConfig:
+    action: str
+    remote: OversizedRemoteConfig
+
+    @property
+    def remote_enabled(self) -> bool:
+        return self.action == "remote" and self.remote.enabled
 
 
 @dataclass(frozen=True)
@@ -265,6 +288,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 "transfer.max_upload_bytes",
             ),
             allow_download_unknown_size=_as_bool(transfer.get("allow_download_unknown_size"), False),
+            oversized=_load_oversized_config(transfer.get("oversized")),
         ),
         filters=_load_content_filters(filters),
         queue=QueueConfig(
@@ -374,3 +398,54 @@ def _positive_int(value: Any, field_name: str) -> int:
     if result == 0:
         raise ValueError(f"{field_name} must be greater than zero")
     return result
+
+
+def _load_oversized_config(raw: Any) -> OversizedConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("transfer.oversized must be a mapping")
+
+    action = str(raw.get("action", "record")).strip().lower()
+    if action not in {"record", "remote"}:
+        raise ValueError("transfer.oversized.action must be either 'record' or 'remote'")
+
+    remote_raw = raw.get("remote") or {}
+    if not isinstance(remote_raw, dict):
+        raise ValueError("transfer.oversized.remote must be a mapping")
+    method = str(remote_raw.get("method", "rclone")).strip().lower()
+    if method not in {"rclone", "webdav"}:
+        raise ValueError("transfer.oversized.remote.method must be either 'rclone' or 'webdav'")
+
+    remote = OversizedRemoteConfig(
+        enabled=_as_bool(remote_raw.get("enabled"), False),
+        method=method,
+        dest=str(remote_raw.get("dest") or "").strip(),
+        extra_args=_string_tuple(remote_raw.get("extra_args"), "transfer.oversized.remote.extra_args"),
+        delete_local_after=_as_bool(remote_raw.get("delete_local_after"), True),
+        webdav_username=str(remote_raw.get("username") or ""),
+        webdav_password=str(remote_raw.get("password") or ""),
+        timeout_seconds=_positive_int(
+            remote_raw.get("timeout_seconds", 3600),
+            "transfer.oversized.remote.timeout_seconds",
+        ),
+    )
+    if action == "remote" and remote.enabled:
+        if not remote.dest:
+            raise ValueError("transfer.oversized.remote.dest is required when remote fallback is enabled")
+        if method == "webdav":
+            _validate_webdav_remote(remote)
+
+    return OversizedConfig(action=action, remote=remote)
+
+
+def _validate_webdav_remote(remote: OversizedRemoteConfig) -> None:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(remote.dest)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("transfer.oversized.remote.dest must be an HTTPS WebDAV URL")
+    if parsed.username or parsed.password:
+        raise ValueError("Put WebDAV credentials in username/password, not the destination URL")
+    if not remote.webdav_username or not remote.webdav_password:
+        raise ValueError("WebDAV remote fallback needs non-empty username and password")

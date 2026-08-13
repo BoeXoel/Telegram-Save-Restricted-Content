@@ -26,13 +26,13 @@ class Worker:
         self.uploader = uploader
         self.logger = logger
 
-    async def run(self, stop_event: asyncio.Event) -> None:
+    async def run(self, stop_event: asyncio.Event, *, only_reason_code: str | None = None) -> None:
         recovered = self.queue.recover_in_progress()
         if recovered and self.logger:
             self.logger.info("Recovered %s interrupted jobs back to pending", recovered)
 
         while not stop_event.is_set():
-            jobs = self.queue.fetch_due(self.config.batch.size)
+            jobs = self.queue.fetch_due(self.config.batch.size, reason_code=only_reason_code)
             if not jobs:
                 if self.logger:
                     self.logger.info("No due pending jobs")
@@ -82,6 +82,7 @@ class Worker:
                     result.reason,
                     reason_code=result.reason_code,
                     transfer_route=result.transfer_route,
+                    remote_uri=result.remote_uri,
                 )
                 if self.logger:
                     self.logger.info("Job %s skipped: %s", job.id, result.reason)

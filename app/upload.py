@@ -20,8 +20,15 @@ from pyrogram.errors import (
 from pyrogram.types import InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 
 from app.config import AppConfig
-from app.errors import DiskFullError, JobSizeLimitError, PermanentJobError, RetryableJobError
+from app.errors import (
+    DiskFullError,
+    DiskLowError,
+    JobSizeLimitError,
+    PermanentJobError,
+    RetryableJobError,
+)
 from app.filters import ContentFilter, FilterMatch
+from app.offload import RemoteOffloader
 from app.queue import MessageJob
 from app.storage import DownloadStorage
 from app.telegram_client import (
@@ -44,6 +51,7 @@ class UploadResult:
     reason: str = ""
     reason_code: str | None = None
     transfer_route: str | None = None
+    remote_uri: str | None = None
 
 
 class Uploader:
@@ -56,6 +64,7 @@ class Uploader:
         logger: Any | None = None,
         writer_capabilities: WriterCapabilities | None = None,
         storage: DownloadStorage | None = None,
+        offloader: RemoteOffloader | None = None,
     ) -> None:
         self.config = config
         self.reader = reader
@@ -64,6 +73,7 @@ class Uploader:
         self.logger = logger
         self.writer_capabilities = writer_capabilities
         self.storage = storage or DownloadStorage(config.downloads)
+        self.offloader = offloader
         self.content_filter = ContentFilter(config.filters)
 
     async def process(
@@ -204,6 +214,12 @@ class Uploader:
     ) -> UploadResult:
         validation_result = self._validate_downloadable_messages(job, messages)
         if validation_result:
+            if (
+                validation_result.reason_code == "oversized"
+                and self.offloader
+                and self.offloader.enabled
+            ):
+                return await self._offload_oversized(job, messages, stop_event, on_phase)
             return validation_result
 
         reservation_bytes = self._job_reservation_bytes(messages)
@@ -245,6 +261,118 @@ class Uploader:
             raise
         finally:
             self._cleanup_job_dir(job_dir, success, force_delete=force_delete)
+
+    async def _offload_oversized(
+        self,
+        job: MessageJob,
+        messages: list[Message],
+        stop_event: asyncio.Event,
+        on_phase: PhaseCallback,
+    ) -> UploadResult:
+        assert self.offloader is not None
+        existing_uri = self.offloader.existing_uri(job)
+        if existing_uri:
+            return UploadResult(
+                status="skipped",
+                reason="Oversized source media was already offloaded to the configured remote",
+                reason_code="oversized",
+                transfer_route="remote",
+                remote_uri=existing_uri,
+            )
+
+        remote_directory = self.offloader.directory_for(job)
+        known_size = self._known_media_bytes(messages)
+        try:
+            if known_size is None:
+                raise DiskLowError("An unknown-size oversized album will be streamed to the remote")
+            self.storage.ensure_job_reservation(known_size)
+        except (DiskLowError, JobSizeLimitError):
+            await self._stream_oversized_to_remote(
+                job,
+                messages,
+                remote_directory,
+                stop_event,
+                on_phase,
+            )
+        else:
+            await self._spool_oversized_to_remote(
+                job,
+                messages,
+                remote_directory,
+                known_size,
+                stop_event,
+                on_phase,
+            )
+
+        self.offloader.record_completed(job, remote_directory)
+        return UploadResult(
+            status="skipped",
+            reason="Oversized source media was offloaded to the configured remote",
+            reason_code="oversized",
+            transfer_route="remote",
+            remote_uri=remote_directory,
+        )
+
+    async def _spool_oversized_to_remote(
+        self,
+        job: MessageJob,
+        messages: list[Message],
+        remote_directory: str,
+        reservation_bytes: int,
+        stop_event: asyncio.Event,
+        on_phase: PhaseCallback,
+    ) -> None:
+        assert self.offloader is not None
+        job_dir = self.config.downloads.active_dir / f"job-{job.id}-remote"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        downloaded: list[tuple[Message, Path]] = []
+        completed_bytes = 0
+        success = False
+        try:
+            await on_phase("downloading")
+            for message in messages:
+                path = await self._download_one(
+                    message,
+                    job_dir,
+                    reservation_bytes=reservation_bytes,
+                    completed_bytes=completed_bytes,
+                )
+                downloaded.append((message, path))
+                completed_bytes += path.stat().st_size
+
+            if stop_event.is_set():
+                raise RetryableJobError("Stop requested before remote upload", reason_code="remote_error")
+
+            await on_phase("uploading")
+            for message, path in downloaded:
+                await self.offloader.upload_file(
+                    path,
+                    self.offloader.file_uri(remote_directory, self._file_name_for(message)),
+                )
+            success = True
+        finally:
+            self._cleanup_remote_spool(job_dir, success)
+
+    async def _stream_oversized_to_remote(
+        self,
+        job: MessageJob,
+        messages: list[Message],
+        remote_directory: str,
+        stop_event: asyncio.Event,
+        on_phase: PhaseCallback,
+    ) -> None:
+        assert self.offloader is not None
+        await on_phase("downloading")
+        for message in messages:
+            if stop_event.is_set():
+                raise RetryableJobError("Stop requested before remote stream", reason_code="remote_error")
+            await self.limiter.wait("download")
+            await on_phase("uploading")
+            await self.offloader.upload_stream(
+                self.reader.stream_media(message),
+                self.offloader.file_uri(remote_directory, self._file_name_for(message)),
+                size=message_file_size(message),
+            )
 
     async def _download_one(
         self,
@@ -410,6 +538,7 @@ class Uploader:
         messages: list[Message],
     ) -> UploadResult | None:
         identity, limit = self._writer_upload_limit()
+        unknown_messages: list[Message] = []
         for message in messages:
             if message_media_type(message) == "text":
                 continue
@@ -417,16 +546,7 @@ class Uploader:
             size = message_file_size(message)
             source = f"source chat {job.source_chat_id}, message {message.id}"
             if size is None:
-                if not self.config.transfer.allow_download_unknown_size:
-                    return UploadResult(
-                        status="skipped",
-                        reason=(
-                            f"File size is unknown for {source}; local download is disabled "
-                            "by transfer.allow_download_unknown_size"
-                        ),
-                        reason_code="unknown_size",
-                        transfer_route="record",
-                    )
+                unknown_messages.append(message)
                 continue
 
             if size > limit:
@@ -439,6 +559,19 @@ class Uploader:
                     reason_code="oversized",
                     transfer_route="record",
                 )
+
+        if unknown_messages and not self.config.transfer.allow_download_unknown_size:
+            message = unknown_messages[0]
+            source = f"source chat {job.source_chat_id}, message {message.id}"
+            return UploadResult(
+                status="skipped",
+                reason=(
+                    f"File size is unknown for {source}; local download is disabled "
+                    "by transfer.allow_download_unknown_size"
+                ),
+                reason_code="unknown_size",
+                transfer_route="record",
+            )
         return None
 
     def _writer_upload_limit(self) -> tuple[str, int]:
@@ -465,6 +598,16 @@ class Uploader:
             return self.config.downloads.max_job_bytes
         return sum(size for size in sizes if size is not None)
 
+    def _known_media_bytes(self, messages: list[Message]) -> int | None:
+        sizes = [
+            message_file_size(message)
+            for message in messages
+            if message_media_type(message) != "text"
+        ]
+        if not sizes or any(size is None for size in sizes):
+            return None
+        return sum(size for size in sizes if size is not None)
+
     def _cleanup_job_dir(self, job_dir: Path, success: bool, *, force_delete: bool = False) -> None:
         if not job_dir.exists():
             return
@@ -485,6 +628,16 @@ class Uploader:
             self._move_directory(job_dir, self.config.downloads.failed_dir / job_dir.name)
             self.storage.prune_failed_jobs()
             return
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+    def _cleanup_remote_spool(self, job_dir: Path, success: bool) -> None:
+        if not job_dir.exists():
+            return
+        if success and not self.config.transfer.oversized.remote.delete_local_after:
+            self._move_directory(job_dir, self.config.downloads.completed_dir / job_dir.name)
+            return
+        # Remote failures never use failed/ because an oversized file could
+        # otherwise fill a small server while waiting for retries.
         shutil.rmtree(job_dir, ignore_errors=True)
 
     def _move_directory(self, source: Path, dest: Path) -> None:

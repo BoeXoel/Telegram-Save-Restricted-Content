@@ -109,6 +109,35 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(row["reason_code"], "disk_low")
             self.assertIsNotNone(row["next_retry_at"])
 
+    def test_reason_filtered_fetch_only_returns_known_oversized_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "queue.sqlite3")
+            database.initialize()
+            queue = MessageQueue(
+                database,
+                SimpleNamespace(queue=SimpleNamespace(max_attempts=4, retry_backoff_seconds=[1])),
+            )
+            for message_id, reason_code in ((1, "oversized"), (2, None)):
+                queue.enqueue(
+                    source_chat_id="source",
+                    source_message_id=message_id,
+                    dest_chat_id="destination",
+                    file_unique_key=f"job-{message_id}",
+                    source_message_ids=[message_id],
+                    source_topic_id=None,
+                    dest_topic_id=None,
+                    media_group_id=None,
+                    media_type="photo",
+                    file_size=10,
+                    caption=None,
+                    reason_code=reason_code,
+                )
+
+            jobs = queue.fetch_due(10, reason_code="oversized")
+            database.close()
+
+            self.assertEqual([job.source_message_id for job in jobs], [1])
+
 
 if __name__ == "__main__":
     unittest.main()

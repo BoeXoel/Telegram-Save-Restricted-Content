@@ -125,8 +125,8 @@ class MessageQueue:
             upload_limit_bytes=upload_limit_bytes,
         )
 
-    def fetch_due(self, limit: int) -> list[MessageJob]:
-        return [MessageJob.from_row(row) for row in self.db.due_jobs(limit)]
+    def fetch_due(self, limit: int, *, reason_code: str | None = None) -> list[MessageJob]:
+        return [MessageJob.from_row(row) for row in self.db.due_jobs(limit, reason_code=reason_code)]
 
     def fetch_for_verification(self, limit: int) -> list[MessageJob]:
         return [MessageJob.from_row(row) for row in self.db.copied_jobs_for_verification(limit)]
@@ -183,6 +183,7 @@ class MessageQueue:
         *,
         reason_code: str | None = None,
         transfer_route: str | None = None,
+        remote_uri: str | None = None,
     ) -> None:
         self.db.set_status(
             job_id,
@@ -190,6 +191,7 @@ class MessageQueue:
             last_error=reason,
             reason_code=reason_code,
             transfer_route=transfer_route,
+            remote_uri=remote_uri,
         )
 
     def mark_verified(self, job_id: int) -> None:

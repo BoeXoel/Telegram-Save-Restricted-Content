@@ -46,6 +46,21 @@ class JobSizeLimitError(PermanentJobError):
         super().__init__(message, reason_code="disk_job_limit")
 
 
+class RemoteConfigurationError(PermanentJobError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason_code="remote_config")
+
+
+class RemotePermissionError(PermanentJobError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason_code="remote_permission_denied")
+
+
+class RemoteTransferError(RetryableJobError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason_code="remote_error")
+
+
 def compact_error(exc: BaseException) -> str:
     message = f"{exc.__class__.__name__}: {exc}"
     return " ".join(message.split())[:4000]

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from app.config import ChatSpec, ContentFilterConfig, load_config
 from app.filters import ContentFilter
 from app.scanner import Scanner
-from app.telegram_client import ResolvedChat
+from app.telegram_client import ResolvedChat, WriterCapabilities
 from app.upload import Uploader
 
 
@@ -119,6 +119,33 @@ class FilterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.reason_code, "ad_filtered")
         self.assertEqual(result.reason, "Skipped by keyword filter rule #1")
 
+    async def test_scan_marks_known_oversized_media_for_the_special_processor(self) -> None:
+        config = _test_config()
+        config.filters = ContentFilterConfig(enabled=False, case_sensitive=False, keywords=(), regex=())
+        queue = _RecordingQueue()
+        scanner = Scanner(
+            config,
+            queue,
+            _FakeReader([_FakeMessage(size=101)]),
+            _FakeLimiter(),
+            writer_capabilities=WriterCapabilities(
+                identity="bot:10",
+                account_type="bot",
+                is_premium=False,
+                max_upload_bytes=100,
+            ),
+        )
+
+        await scanner._scan_source(
+            ChatSpec(chat="source", start_id=1, end_id=1),
+            [ResolvedChat(chat_id="destination", topic_id=None, title="Destination")],
+            _NeverSetEvent(),
+        )
+
+        self.assertEqual(queue.calls[0]["status"], "pending")
+        self.assertEqual(queue.calls[0]["reason_code"], "oversized")
+        self.assertEqual(queue.calls[0]["transfer_route"], "pending")
+
 
 class _RecordingQueue:
     def __init__(self) -> None:
@@ -146,13 +173,13 @@ class _FakeReader:
 
 
 class _FakeMessage:
-    def __init__(self, *, caption: str | None = None) -> None:
+    def __init__(self, *, caption: str | None = None, size: int = 10) -> None:
         self.id = 1
         self.caption = caption
         self.text = None
         self.media_group_id = None
         self.video = None
-        self.photo = SimpleNamespace(file_size=10, file_unique_id="photo-1", file_id="photo-1")
+        self.photo = SimpleNamespace(file_size=size, file_unique_id="photo-1", file_id="photo-1")
         self.document = None
         self.animation = None
         self.audio = None

@@ -7,6 +7,7 @@ from contextlib import AsyncExitStack
 from app.config import AppConfig, load_config
 from app.db import Database
 from app.logging import setup_logging
+from app.offload import RemoteOffloader
 from app.queue import MessageQueue
 from app.scanner import Scanner
 from app.storage import DownloadStorage, format_bytes
@@ -32,10 +33,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
     parser.add_argument("--session", help="Session name for login command")
+    parser.add_argument(
+        "--oversized-only",
+        action="store_true",
+        help="Process only known oversized jobs (valid with the process command)",
+    )
     return parser.parse_args()
 
 
-async def run_with_clients(config: AppConfig, command: str) -> None:
+async def run_with_clients(config: AppConfig, command: str, *, oversized_only: bool = False) -> None:
     logger = setup_logging(config.logging)
     limiter = TelegramLimiter(config, logger)
     stop_event = asyncio.Event()
@@ -44,6 +50,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
     db = Database(config.queue.db_path)
     db.initialize()
     queue = MessageQueue(db, config)
+    offloader = RemoteOffloader(config.transfer.oversized, db, logger=logger)
     storage = DownloadStorage(config.downloads)
     removed_active = storage.cleanup_active_jobs()
     removed_failed = storage.prune_failed_jobs()
@@ -118,9 +125,10 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                     logger=logger,
                     writer_capabilities=writer_capabilities,
                     storage=storage,
+                    offloader=offloader,
                 )
                 worker = Worker(config, queue, uploader, logger=logger)
-                await worker.run(stop_event)
+                await worker.run(stop_event, only_reason_code="oversized" if oversized_only else None)
 
             if command == "verify" and not stop_event.is_set():
                 verifier = Verifier(config, queue, writer, limiter, logger=logger)
@@ -139,6 +147,8 @@ def print_counts(counts: dict[str, int]) -> None:
 
 async def async_main() -> None:
     args = parse_args()
+    if args.oversized_only and args.command != "process":
+        raise ValueError("--oversized-only can only be used with the process command")
     config = load_config(args.config)
     config.ensure_directories()
 
@@ -146,7 +156,7 @@ async def async_main() -> None:
         await interactive_login(config, args.session)
         return
 
-    await run_with_clients(config, args.command)
+    await run_with_clients(config, args.command, oversized_only=args.oversized_only)
 
 
 def main() -> None:

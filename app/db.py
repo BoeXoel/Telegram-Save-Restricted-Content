@@ -78,6 +78,14 @@ class Database:
                 ON messages(status, next_retry_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_messages_source
                 ON messages(source_chat_id, source_message_id);
+
+            CREATE TABLE IF NOT EXISTS remote_objects (
+                source_chat_id TEXT NOT NULL,
+                file_unique_key TEXT NOT NULL,
+                remote_uri TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (source_chat_id, file_unique_key)
+            );
             """
         )
         self._migrate_message_columns()
@@ -301,18 +309,47 @@ class Database:
         self.conn.commit()
         return cursor.rowcount
 
-    def due_jobs(self, limit: int) -> list[sqlite3.Row]:
+    def due_jobs(self, limit: int, *, reason_code: str | None = None) -> list[sqlite3.Row]:
         now = utc_now()
+        reason_clause = ""
+        params: list[Any] = [now]
+        if reason_code is not None:
+            reason_clause = " AND reason_code = ?"
+            params.append(reason_code)
+        params.append(limit)
         return self.query(
-            """
+            f"""
             SELECT *
             FROM messages
             WHERE status = 'pending'
               AND (next_retry_at IS NULL OR next_retry_at <= ?)
+              {reason_clause}
             ORDER BY updated_at ASC, id ASC
             LIMIT ?
             """,
-            (now, limit),
+            params,
+        )
+
+    def remote_uri_for_source(self, source_chat_id: str, file_unique_key: str) -> str | None:
+        row = self.conn.execute(
+            """
+            SELECT remote_uri
+            FROM remote_objects
+            WHERE source_chat_id = ? AND file_unique_key = ?
+            """,
+            (source_chat_id, file_unique_key),
+        ).fetchone()
+        return str(row["remote_uri"]) if row else None
+
+    def record_remote_object(self, source_chat_id: str, file_unique_key: str, remote_uri: str) -> None:
+        self.execute(
+            """
+            INSERT INTO remote_objects (source_chat_id, file_unique_key, remote_uri, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_chat_id, file_unique_key)
+            DO UPDATE SET remote_uri = excluded.remote_uri, created_at = excluded.created_at
+            """,
+            (source_chat_id, file_unique_key, remote_uri, utc_now()),
         )
 
     def copied_jobs_for_verification(self, limit: int) -> list[sqlite3.Row]:

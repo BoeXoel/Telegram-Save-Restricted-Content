@@ -115,6 +115,7 @@ class Scanner:
         for group in grouped:
             first = group[0]
             filter_match = self._filter_match(group)
+            oversized_reason = self._oversized_reason(group)
             processable = self._group_should_process(group) and filter_match is None
             status = "pending" if processable else "skipped"
             if status == "skipped" and not self.config.queue.record_skipped:
@@ -142,8 +143,19 @@ class Scanner:
                     file_size=file_size,
                     caption=caption,
                     status=status,
-                    last_error=self._skip_reason(filter_match, group) if not processable else None,
-                    reason_code=filter_match.reason_code if filter_match else None,
+                    last_error=(
+                        self._skip_reason(filter_match, group)
+                        if not processable
+                        else oversized_reason
+                    ),
+                    reason_code=(
+                        filter_match.reason_code
+                        if filter_match
+                        else "oversized"
+                        if oversized_reason
+                        else None
+                    ),
+                    transfer_route="pending" if processable and oversized_reason else None,
                     media_manifest=self._group_media_manifest(group),
                     writer_identity=(
                         self.writer_capabilities.identity if self.writer_capabilities else None
@@ -181,6 +193,21 @@ class Scanner:
         if not self._group_should_process(messages):
             return "Skipped because its message type is disabled by configuration"
         return "Skipped by configuration"
+
+    def _oversized_reason(self, messages: list[Message]) -> str | None:
+        if not self.writer_capabilities:
+            return None
+        limit = self.writer_capabilities.max_upload_bytes
+        for message in messages:
+            if message_media_type(message) == "text":
+                continue
+            size = message_file_size(message)
+            if size is not None and size > limit:
+                return (
+                    f"Detected {size}-byte media above the {limit}-byte local upload limit; "
+                    "native copy or configured remote fallback may still be attempted"
+                )
+        return None
 
     def _message_should_process(self, message: Message) -> bool:
         media_type = message_media_type(message)

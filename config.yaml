@@ -44,6 +44,24 @@ transfer:
     enabled: true
     only: false
 
+  # Files above Telegram's sending limit are normally only recorded.  Set
+  # action to remote and enable a preconfigured remote only if you need to
+  # retain them outside Telegram.
+  oversized:
+    action: record              # record | remote
+    remote:
+      enabled: false
+      method: rclone            # rclone | webdav
+      # rclone example: "archive:telegram/oversized"
+      # WebDAV example: "https://cloud.example/dav/telegram/oversized"
+      dest: ""
+      extra_args: []
+      delete_local_after: true
+      # Only used with method: webdav. Put real values in .env, never Git.
+      username: "${WEBDAV_USERNAME}"
+      password: "${WEBDAV_PASSWORD}"
+      timeout_seconds: 3600
+
 # Disabled by default.  When enabled, a matching text message or media caption
 # skips the entire message or album.  Matched text is never written to logs.
 filters:
