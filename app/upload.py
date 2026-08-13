@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -19,9 +20,10 @@ from pyrogram.errors import (
 from pyrogram.types import InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 
 from app.config import AppConfig
-from app.errors import PermanentJobError, RetryableJobError
+from app.errors import DiskFullError, JobSizeLimitError, PermanentJobError, RetryableJobError
 from app.filters import ContentFilter, FilterMatch
 from app.queue import MessageJob
+from app.storage import DownloadStorage
 from app.telegram_client import (
     TelegramLimiter,
     WriterCapabilities,
@@ -53,6 +55,7 @@ class Uploader:
         limiter: TelegramLimiter,
         logger: Any | None = None,
         writer_capabilities: WriterCapabilities | None = None,
+        storage: DownloadStorage | None = None,
     ) -> None:
         self.config = config
         self.reader = reader
@@ -60,6 +63,7 @@ class Uploader:
         self.limiter = limiter
         self.logger = logger
         self.writer_capabilities = writer_capabilities
+        self.storage = storage or DownloadStorage(config.downloads)
         self.content_filter = ContentFilter(config.filters)
 
     async def process(
@@ -202,16 +206,27 @@ class Uploader:
         if validation_result:
             return validation_result
 
+        reservation_bytes = self._job_reservation_bytes(messages)
+        self.storage.ensure_job_reservation(reservation_bytes)
+
         job_dir = self.config.downloads.active_dir / f"job-{job.id}"
         job_dir.mkdir(parents=True, exist_ok=True)
         downloaded: list[tuple[Message, Path]] = []
         success = False
+        force_delete = False
+        completed_bytes = 0
 
         try:
             await on_phase("downloading")
             for message in messages:
-                path = await self._download_one(message, job_dir)
+                path = await self._download_one(
+                    message,
+                    job_dir,
+                    reservation_bytes=reservation_bytes,
+                    completed_bytes=completed_bytes,
+                )
                 downloaded.append((message, path))
+                completed_bytes += path.stat().st_size
 
             if stop_event.is_set():
                 raise RetryableJobError("Stop requested after download; leaving job for retry")
@@ -220,13 +235,55 @@ class Uploader:
             result = await self._upload_downloaded(job, downloaded)
             success = True
             return result
+        except DiskFullError:
+            force_delete = True
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+                force_delete = True
+                raise DiskFullError("The filesystem reported that it is out of space") from exc
+            raise
         finally:
-            self._cleanup_job_dir(job_dir, success)
+            self._cleanup_job_dir(job_dir, success, force_delete=force_delete)
 
-    async def _download_one(self, message: Message, job_dir: Path) -> Path:
+    async def _download_one(
+        self,
+        message: Message,
+        job_dir: Path,
+        *,
+        reservation_bytes: int,
+        completed_bytes: int,
+    ) -> Path:
         path = job_dir / self._file_name_for(message)
-        result = await self.limiter.call("download", message.download, file_name=str(path))
-        return Path(result or path)
+        progress_error: DiskFullError | None = None
+
+        async def check_progress(current: int, _total: int) -> None:
+            nonlocal progress_error
+            remaining = reservation_bytes - completed_bytes - max(0, int(current))
+            try:
+                self.storage.ensure_progress_reservation(remaining)
+            except DiskFullError as exc:
+                progress_error = exc
+                stop_transmission = getattr(self.reader, "stop_transmission", None)
+                if callable(stop_transmission):
+                    stop_transmission()
+                raise
+
+        result = await self.limiter.call(
+            "download",
+            message.download,
+            file_name=str(path),
+            progress=check_progress,
+        )
+        if progress_error:
+            raise progress_error
+
+        downloaded_path = Path(result or path)
+        if not downloaded_path.exists():
+            if self.storage.free_bytes() < self.config.downloads.min_free_bytes:
+                raise DiskFullError("Download stopped after the filesystem fell below its reserved free space")
+            raise RetryableJobError("Telegram download did not produce a local file", reason_code="network_error")
+        return downloaded_path
 
     async def _upload_downloaded(
         self,
@@ -393,16 +450,40 @@ class Uploader:
         override = self.config.transfer.max_upload_bytes
         return "unknown_writer", override or self.config.transfer.max_bot_upload_bytes
 
-    def _cleanup_job_dir(self, job_dir: Path, success: bool) -> None:
+    def _job_reservation_bytes(self, messages: list[Message]) -> int:
+        sizes = [
+            message_file_size(message)
+            for message in messages
+            if message_media_type(message) != "text"
+        ]
+        if any(size is None for size in sizes):
+            if self.config.downloads.max_job_bytes == 0:
+                raise JobSizeLimitError(
+                    "A media item has no known size; set downloads.max_job_bytes before allowing "
+                    "unknown-size downloads"
+                )
+            return self.config.downloads.max_job_bytes
+        return sum(size for size in sizes if size is not None)
+
+    def _cleanup_job_dir(self, job_dir: Path, success: bool, *, force_delete: bool = False) -> None:
         if not job_dir.exists():
+            return
+
+        if force_delete:
+            shutil.rmtree(job_dir, ignore_errors=True)
             return
 
         keep_completed = self.config.downloads.keep_completed or self.config.transfer.save_to_local
         if success and keep_completed:
             self._move_directory(job_dir, self.config.downloads.completed_dir / job_dir.name)
             return
-        if not success and self.config.downloads.keep_failed:
+        if (
+            not success
+            and self.config.downloads.keep_failed
+            and self.config.downloads.max_failed_bytes > 0
+        ):
             self._move_directory(job_dir, self.config.downloads.failed_dir / job_dir.name)
+            self.storage.prune_failed_jobs()
             return
         shutil.rmtree(job_dir, ignore_errors=True)
 

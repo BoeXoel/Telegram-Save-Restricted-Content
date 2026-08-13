@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 from app.config import ContentFilterConfig
+from app.errors import DiskFullError, DiskLowError
 from app.telegram_client import (
     BOT_UPLOAD_LIMIT_BYTES,
     PREMIUM_USER_UPLOAD_LIMIT_BYTES,
@@ -69,6 +71,37 @@ class LocalUploadLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((active_dir / "job-7").exists())
             self.assertFalse(message.download_called)
 
+    async def test_enospc_removes_the_active_job_instead_of_caching_it_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_dir = Path(temp_dir) / "active"
+            message = _EnospcMediaMessage(10)
+            uploader = _uploader(
+                active_dir,
+                [message],
+                limit=100,
+                keep_failed=True,
+                max_failed_bytes=100,
+            )
+
+            with self.assertRaises(DiskFullError):
+                await uploader.process(_job(), _NeverSetEvent(), _allowed_phase)
+
+            self.assertTrue(message.download_called)
+            self.assertFalse((active_dir / "job-7").exists())
+            self.assertFalse((active_dir.parent / "failed" / "job-7").exists())
+
+    async def test_low_disk_space_blocks_the_job_before_any_download_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_dir = Path(temp_dir) / "active"
+            message = _MediaMessage(10)
+            uploader = _uploader(active_dir, [message], limit=100, storage=_LowStorage())
+
+            with self.assertRaises(DiskLowError):
+                await uploader.process(_job(), _NeverSetEvent(), _unexpected_phase)
+
+            self.assertFalse((active_dir / "job-7").exists())
+            self.assertFalse(message.download_called)
+
 
 class _MediaMessage:
     def __init__(self, size: int | None) -> None:
@@ -93,6 +126,15 @@ class _MediaMessage:
         raise AssertionError("A rejected file must not be downloaded")
 
 
+class _EnospcMediaMessage(_MediaMessage):
+    async def download(self, **kwargs: object) -> str:
+        self.download_called = True
+        path = Path(str(kwargs["file_name"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"partial")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
 class _Reader:
     def __init__(self, messages: list[_MediaMessage]) -> None:
         self.messages = messages
@@ -106,6 +148,11 @@ class _Limiter:
         return await function(*args, **kwargs)  # type: ignore[misc]
 
 
+class _LowStorage:
+    def ensure_job_reservation(self, _required_bytes: int) -> None:
+        raise DiskLowError("Test disk reserve reached")
+
+
 class _NeverSetEvent:
     def is_set(self) -> bool:
         return False
@@ -113,6 +160,10 @@ class _NeverSetEvent:
 
 async def _unexpected_phase(_phase: str) -> None:
     raise AssertionError("A rejected file must not enter a transfer phase")
+
+
+async def _allowed_phase(_phase: str) -> None:
+    return
 
 
 def _capability_config(*, max_upload_bytes: int = 0) -> object:
@@ -124,7 +175,15 @@ def _capability_config(*, max_upload_bytes: int = 0) -> object:
     )
 
 
-def _uploader(active_dir: Path, messages: list[_MediaMessage], *, limit: int) -> Uploader:
+def _uploader(
+    active_dir: Path,
+    messages: list[_MediaMessage],
+    *,
+    limit: int,
+    keep_failed: bool = False,
+    max_failed_bytes: int = 0,
+    storage: object | None = None,
+) -> Uploader:
     config = SimpleNamespace(
         filters=ContentFilterConfig(enabled=False, case_sensitive=False, keywords=(), regex=()),
         transfer=SimpleNamespace(
@@ -141,7 +200,17 @@ def _uploader(active_dir: Path, messages: list[_MediaMessage], *, limit: int) ->
             max_upload_bytes=0,
             max_bot_upload_bytes=limit,
         ),
-        downloads=SimpleNamespace(active_dir=active_dir, keep_completed=False, keep_failed=False),
+        downloads=SimpleNamespace(
+            root=active_dir.parent,
+            active_dir=active_dir,
+            failed_dir=active_dir.parent / "failed",
+            completed_dir=active_dir.parent / "completed",
+            keep_completed=False,
+            keep_failed=keep_failed,
+            min_free_bytes=0,
+            max_failed_bytes=max_failed_bytes,
+            max_job_bytes=0,
+        ),
     )
     return Uploader(
         config,
@@ -154,6 +223,7 @@ def _uploader(active_dir: Path, messages: list[_MediaMessage], *, limit: int) ->
             is_premium=False,
             max_upload_bytes=limit,
         ),
+        storage=storage,
     )
 
 

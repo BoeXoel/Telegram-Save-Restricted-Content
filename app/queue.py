@@ -136,6 +136,26 @@ class MessageQueue:
         self.db.set_status(job.id, "downloading")
         return attempts
 
+    def defer(
+        self,
+        job: MessageJob,
+        error: str,
+        *,
+        reason_code: str | None,
+        retry_after_seconds: int,
+    ) -> None:
+        self.db.decrement_attempt(job.id)
+        next_retry = (datetime.now(timezone.utc) + timedelta(seconds=retry_after_seconds)).isoformat(
+            timespec="seconds"
+        )
+        self.db.set_status(
+            job.id,
+            "pending",
+            last_error=error,
+            next_retry_at=next_retry,
+            reason_code=reason_code,
+        )
+
     def set_phase(self, job_id: int, status: str) -> None:
         self.db.set_status(job_id, status)
 
@@ -175,14 +195,27 @@ class MessageQueue:
     def mark_verified(self, job_id: int) -> None:
         self.db.set_status(job_id, "copied", verified_at=utc_now())
 
-    def mark_failure(self, job: MessageJob, error: str, attempts: int) -> str:
+    def mark_failure(
+        self,
+        job: MessageJob,
+        error: str,
+        attempts: int,
+        *,
+        reason_code: str | None = "network_error",
+    ) -> str:
         if attempts >= self.config.queue.max_attempts:
-            self.db.set_status(job.id, "failed", last_error=error)
+            self.db.set_status(job.id, "failed", last_error=error, reason_code=reason_code)
             return "failed"
 
         backoff = self._backoff_for_attempt(attempts)
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
-        self.db.set_status(job.id, "pending", last_error=error, next_retry_at=next_retry)
+        self.db.set_status(
+            job.id,
+            "pending",
+            last_error=error,
+            next_retry_at=next_retry,
+            reason_code=reason_code,
+        )
         return "pending"
 
     def recover_in_progress(self) -> int:

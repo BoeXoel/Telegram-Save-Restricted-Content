@@ -186,6 +186,7 @@ def _test_config() -> object:
             include_text=True,
             include_documents=True,
         ),
+        downloads=SimpleNamespace(),
     )
 
 

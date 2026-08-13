@@ -83,8 +83,17 @@ downloads:
   active_dir: "downloads/active"
   failed_dir: "downloads/failed"
   completed_dir: "downloads/completed"
-  keep_failed: true
+  # Failed downloads are deleted by default.  Set both values below to keep a
+  # bounded troubleshooting cache.
+  keep_failed: false
   keep_completed: false
+  # Always leave 5 GiB free for the host and other services.
+  min_free_bytes: 5368709120
+  # 0 prohibits failed-download accumulation.  A positive value keeps only
+  # the newest job-* directories that fit below this total.
+  max_failed_bytes: 0
+  # 0 means each job may use at most the currently free space above the reserve.
+  max_job_bytes: 0
 
 logging:
   level: "INFO"

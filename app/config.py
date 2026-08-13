@@ -160,6 +160,9 @@ class DownloadsConfig:
     completed_dir: Path
     keep_failed: bool
     keep_completed: bool
+    min_free_bytes: int
+    max_failed_bytes: int
+    max_job_bytes: int
 
 
 @dataclass(frozen=True)
@@ -292,8 +295,20 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             active_dir=active_dir,
             failed_dir=failed_dir,
             completed_dir=completed_dir,
-            keep_failed=_as_bool(downloads.get("keep_failed"), True),
+            keep_failed=_as_bool(downloads.get("keep_failed"), False),
             keep_completed=_as_bool(downloads.get("keep_completed"), False),
+            min_free_bytes=_nonnegative_int(
+                downloads.get("min_free_bytes", 5 * 1024 * 1024 * 1024),
+                "downloads.min_free_bytes",
+            ),
+            max_failed_bytes=_nonnegative_int(
+                downloads.get("max_failed_bytes", 0),
+                "downloads.max_failed_bytes",
+            ),
+            max_job_bytes=_nonnegative_int(
+                downloads.get("max_job_bytes", 0),
+                "downloads.max_job_bytes",
+            ),
         ),
         logging=LoggingConfig(
             level=str(logging_cfg.get("level", "INFO")).upper(),

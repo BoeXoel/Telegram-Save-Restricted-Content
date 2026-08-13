@@ -7,7 +7,7 @@ from pyrogram import Client
 from pyrogram.errors import BadRequest, ChannelInvalid, ChannelPrivate, ChatWriteForbidden, MediaEmpty
 
 from app.config import AppConfig
-from app.errors import PermanentJobError, RetryableJobError, compact_error
+from app.errors import DeferredJobError, PermanentJobError, RetryableJobError, compact_error
 from app.queue import MessageJob, MessageQueue
 from app.telegram_client import TelegramLimiter, message_is_empty
 from app.upload import Uploader
@@ -88,15 +88,33 @@ class Worker:
             else:
                 raise RuntimeError(f"Unknown upload result status: {result.status}")
         except PermanentJobError as exc:
-            self.queue.mark_skipped(job.id, compact_error(exc))
+            self.queue.mark_skipped(job.id, compact_error(exc), reason_code=exc.reason_code)
             if self.logger:
                 self.logger.warning("Job %s skipped permanently: %s", job.id, exc)
+        except DeferredJobError as exc:
+            self.queue.defer(
+                job,
+                compact_error(exc),
+                reason_code=exc.reason_code,
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+            if self.logger:
+                self.logger.warning(
+                    "Job %s deferred without consuming an attempt: %s",
+                    job.id,
+                    exc,
+                )
         except RetryableJobError as exc:
-            status = self.queue.mark_failure(job, compact_error(exc), attempts)
+            status = self.queue.mark_failure(
+                job,
+                compact_error(exc),
+                attempts,
+                reason_code=exc.reason_code or "network_error",
+            )
             if self.logger:
                 self.logger.warning("Job %s %s after retryable stop: %s", job.id, status, exc)
         except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden, MediaEmpty, BadRequest) as exc:
-            self.queue.mark_skipped(job.id, compact_error(exc))
+            self.queue.mark_skipped(job.id, compact_error(exc), reason_code="permission_denied")
             if self.logger:
                 self.logger.warning("Job %s skipped by Telegram error: %s", job.id, exc)
         except Exception as exc:

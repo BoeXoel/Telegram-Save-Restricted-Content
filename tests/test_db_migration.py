@@ -4,8 +4,10 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.db import Database
+from app.queue import MessageQueue
 
 
 class DatabaseMigrationTests(unittest.TestCase):
@@ -68,6 +70,44 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(row["media_manifest"], '[{"message_id": 1, "size": 123}]')
             self.assertEqual(row["writer_identity"], "bot:123")
             self.assertEqual(row["upload_limit_bytes"], 100)
+
+    def test_deferred_job_does_not_consume_a_transfer_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "queue.sqlite3")
+            database.initialize()
+            queue = MessageQueue(
+                database,
+                SimpleNamespace(queue=SimpleNamespace(max_attempts=4, retry_backoff_seconds=[1])),
+            )
+            queue.enqueue(
+                source_chat_id="source",
+                source_message_id=1,
+                dest_chat_id="destination",
+                file_unique_key="job-1",
+                source_message_ids=[1],
+                source_topic_id=None,
+                dest_topic_id=None,
+                media_group_id=None,
+                media_type="photo",
+                file_size=10,
+                caption=None,
+            )
+            job = queue.fetch_due(1)[0]
+            attempts = queue.start_attempt(job)
+            queue.defer(
+                job,
+                "Not enough free disk space",
+                reason_code="disk_low",
+                retry_after_seconds=60,
+            )
+            row = database.query("SELECT attempts, status, reason_code, next_retry_at FROM messages")[0]
+            database.close()
+
+            self.assertEqual(attempts, 1)
+            self.assertEqual(row["attempts"], 0)
+            self.assertEqual(row["status"], "pending")
+            self.assertEqual(row["reason_code"], "disk_low")
+            self.assertIsNotNone(row["next_retry_at"])
 
 
 if __name__ == "__main__":

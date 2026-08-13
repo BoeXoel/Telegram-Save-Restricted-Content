@@ -9,6 +9,7 @@ from app.db import Database
 from app.logging import setup_logging
 from app.queue import MessageQueue
 from app.scanner import Scanner
+from app.storage import DownloadStorage, format_bytes
 from app.telegram_client import (
     TelegramLimiter,
     get_writer_capabilities,
@@ -43,6 +44,22 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
     db = Database(config.queue.db_path)
     db.initialize()
     queue = MessageQueue(db, config)
+    storage = DownloadStorage(config.downloads)
+    removed_active = storage.cleanup_active_jobs()
+    removed_failed = storage.prune_failed_jobs()
+    disk = storage.summary()
+    logger.info(
+        "Disk summary: free=%s min_free=%s failed=%s",
+        format_bytes(disk.free_bytes),
+        format_bytes(disk.min_free_bytes),
+        format_bytes(disk.failed_bytes),
+    )
+    if removed_active or removed_failed:
+        logger.info(
+            "Removed stale managed download directories: active=%s failed=%s",
+            removed_active,
+            removed_failed,
+        )
 
     try:
         if command == "stats":
@@ -100,6 +117,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                     limiter,
                     logger=logger,
                     writer_capabilities=writer_capabilities,
+                    storage=storage,
                 )
                 worker = Worker(config, queue, uploader, logger=logger)
                 await worker.run(stop_event)

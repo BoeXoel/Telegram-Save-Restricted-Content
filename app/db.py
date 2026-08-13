@@ -276,6 +276,17 @@ class Database:
         self.conn.commit()
         return int(row["attempts"])
 
+    def decrement_attempt(self, job_id: int) -> None:
+        self.execute(
+            """
+            UPDATE messages
+            SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), job_id),
+        )
+
     def recover_in_progress(self) -> int:
         cursor = self.conn.execute(
             """
