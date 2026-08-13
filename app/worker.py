@@ -4,10 +4,25 @@ import asyncio
 from typing import Any
 
 from pyrogram import Client
-from pyrogram.errors import BadRequest, ChannelInvalid, ChannelPrivate, ChatWriteForbidden, MediaEmpty
+from pyrogram.errors import (
+    BadRequest,
+    ChannelInvalid,
+    ChannelPrivate,
+    ChatWriteForbidden,
+    MediaEmpty,
+    MessageIdInvalid,
+    PeerFlood,
+    UserRestricted,
+)
 
 from app.config import AppConfig
-from app.errors import DeferredJobError, PermanentJobError, RetryableJobError, compact_error
+from app.errors import (
+    AccountRestrictedError,
+    DeferredJobError,
+    PermanentJobError,
+    RetryableJobError,
+    compact_error,
+)
 from app.queue import MessageJob, MessageQueue
 from app.telegram_client import TelegramLimiter, message_is_empty
 from app.upload import Uploader
@@ -105,6 +120,24 @@ class Worker:
                     job.id,
                     exc,
                 )
+        except (PeerFlood, UserRestricted) as exc:
+            restricted = AccountRestrictedError(
+                "Telegram restricted the active account; the run was paused without rotating accounts",
+                retry_after_seconds=self.config.limits.account_restricted_retry_seconds,
+            )
+            self.queue.defer(
+                job,
+                compact_error(restricted),
+                reason_code=restricted.reason_code,
+                retry_after_seconds=restricted.retry_after_seconds,
+            )
+            stop_event.set()
+            if self.logger:
+                self.logger.error("Job %s paused after an account restriction: %s", job.id, exc)
+        except (MessageIdInvalid, MediaEmpty) as exc:
+            self.queue.mark_skipped(job.id, compact_error(exc), reason_code="source_missing")
+            if self.logger:
+                self.logger.warning("Job %s skipped because the source is unavailable: %s", job.id, exc)
         except RetryableJobError as exc:
             status = self.queue.mark_failure(
                 job,
@@ -114,7 +147,7 @@ class Worker:
             )
             if self.logger:
                 self.logger.warning("Job %s %s after retryable stop: %s", job.id, status, exc)
-        except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden, MediaEmpty, BadRequest) as exc:
+        except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden, BadRequest) as exc:
             self.queue.mark_skipped(job.id, compact_error(exc), reason_code="permission_denied")
             if self.logger:
                 self.logger.warning("Job %s skipped by Telegram error: %s", job.id, exc)

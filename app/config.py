@@ -156,6 +156,8 @@ class LimitsConfig:
     get_messages_chunk_size: int
     floodwait_extra_min_seconds: int
     floodwait_extra_max_seconds: int
+    floodwait_defer_after_seconds: int
+    account_restricted_retry_seconds: int
 
     def delay_for(self, operation: str) -> float:
         return {
@@ -308,6 +310,14 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             get_messages_chunk_size=int(limits.get("get_messages_chunk_size", 100)),
             floodwait_extra_min_seconds=int(limits.get("floodwait_extra_min_seconds", 5)),
             floodwait_extra_max_seconds=int(limits.get("floodwait_extra_max_seconds", 20)),
+            floodwait_defer_after_seconds=_positive_int(
+                limits.get("floodwait_defer_after_seconds", 60),
+                "limits.floodwait_defer_after_seconds",
+            ),
+            account_restricted_retry_seconds=_positive_int(
+                limits.get("account_restricted_retry_seconds", 86_400),
+                "limits.account_restricted_retry_seconds",
+            ),
         ),
         batch=BatchConfig(
             size=int(batch.get("size", 25)),

@@ -31,6 +31,24 @@ class DeferredJobError(RetryableJobError):
         self.retry_after_seconds = max(1, retry_after_seconds)
 
 
+class FloodWaitDeferred(DeferredJobError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__(
+            f"Telegram requested a {retry_after_seconds}-second FloodWait",
+            reason_code="flood_wait",
+            retry_after_seconds=retry_after_seconds,
+        )
+
+
+class AccountRestrictedError(DeferredJobError):
+    def __init__(self, message: str, *, retry_after_seconds: int) -> None:
+        super().__init__(
+            message,
+            reason_code="account_restricted",
+            retry_after_seconds=retry_after_seconds,
+        )
+
+
 class DiskLowError(DeferredJobError):
     def __init__(self, message: str) -> None:
         super().__init__(message, reason_code="disk_low")

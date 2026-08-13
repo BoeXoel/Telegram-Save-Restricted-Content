@@ -90,6 +90,10 @@ limits:
   get_messages_chunk_size: 100
   floodwait_extra_min_seconds: 5
   floodwait_extra_max_seconds: 20
+  # Longer FloodWaits are recorded for retry instead of keeping one-shot runs alive.
+  floodwait_defer_after_seconds: 60
+  # Account-risk errors stop the current run and retry no sooner than this delay.
+  account_restricted_retry_seconds: 86400
 
 batch:
   size: 25

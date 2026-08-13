@@ -15,6 +15,7 @@ from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, Sessi
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
+from app.errors import FloodWaitDeferred
 
 
 BOT_UPLOAD_LIMIT_BYTES = 2_000 * 1024 * 1024
@@ -100,6 +101,13 @@ class TelegramLimiter:
                 extra_min = self.config.limits.floodwait_extra_min_seconds
                 extra_max = self.config.limits.floodwait_extra_max_seconds
                 wait = int(exc.value) + random.randint(extra_min, extra_max)
+                if wait > self.config.limits.floodwait_defer_after_seconds:
+                    if self.logger:
+                        self.logger.warning(
+                            "FloodWait from Telegram: deferring the current job for %ss",
+                            wait,
+                        )
+                    raise FloodWaitDeferred(wait) from exc
                 if self.logger:
                     self.logger.warning("FloodWait from Telegram: sleeping %ss", wait)
                 await asyncio.sleep(wait)
