@@ -139,6 +139,13 @@ class MessageQueue:
     def set_phase(self, job_id: int, status: str) -> None:
         self.db.set_status(job_id, status)
 
+    def record_writer(self, job_id: int, identity: str, upload_limit_bytes: int) -> None:
+        self.db.update_metadata(
+            job_id,
+            writer_identity=identity,
+            upload_limit_bytes=upload_limit_bytes,
+        )
+
     def mark_copied(self, job_id: int, dest_message_ids: list[int]) -> None:
         self.db.set_status(
             job_id,
@@ -146,10 +153,24 @@ class MessageQueue:
             last_error="",
             dest_message_ids=dest_message_ids,
             reason_code=None,
+            transfer_route="telegram",
         )
 
-    def mark_skipped(self, job_id: int, reason: str, *, reason_code: str | None = None) -> None:
-        self.db.set_status(job_id, "skipped", last_error=reason, reason_code=reason_code)
+    def mark_skipped(
+        self,
+        job_id: int,
+        reason: str,
+        *,
+        reason_code: str | None = None,
+        transfer_route: str | None = None,
+    ) -> None:
+        self.db.set_status(
+            job_id,
+            "skipped",
+            last_error=reason,
+            reason_code=reason_code,
+            transfer_route=transfer_route,
+        )
 
     def mark_verified(self, job_id: int) -> None:
         self.db.set_status(job_id, "copied", verified_at=utc_now())

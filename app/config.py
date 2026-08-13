@@ -101,6 +101,8 @@ class TransferConfig:
     forwarding_only: bool
     save_to_local: bool
     max_bot_upload_bytes: int
+    max_upload_bytes: int
+    allow_download_unknown_size: bool
 
 
 @dataclass(frozen=True)
@@ -251,7 +253,15 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             prefer_copy=_as_bool((transfer.get("native_copy") or {}).get("enabled"), True),
             forwarding_only=_as_bool((transfer.get("native_copy") or {}).get("only"), False),
             save_to_local=_as_bool(transfer.get("save_to_local"), False),
-            max_bot_upload_bytes=int(transfer.get("max_bot_upload_bytes", 2_000 * 1024 * 1024)),
+            max_bot_upload_bytes=_positive_int(
+                transfer.get("max_bot_upload_bytes", 2_000 * 1024 * 1024),
+                "transfer.max_bot_upload_bytes",
+            ),
+            max_upload_bytes=_nonnegative_int(
+                transfer.get("max_upload_bytes", 0),
+                "transfer.max_upload_bytes",
+            ),
+            allow_download_unknown_size=_as_bool(transfer.get("allow_download_unknown_size"), False),
         ),
         filters=_load_content_filters(filters),
         queue=QueueConfig(
@@ -332,3 +342,20 @@ def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
         if item:
             result.append(item)
     return tuple(result)
+
+
+def _nonnegative_int(value: Any, field_name: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if result < 0:
+        raise ValueError(f"{field_name} cannot be negative")
+    return result
+
+
+def _positive_int(value: Any, field_name: str) -> int:
+    result = _nonnegative_int(value, field_name)
+    if result == 0:
+        raise ValueError(f"{field_name} must be greater than zero")
+    return result

@@ -223,6 +223,34 @@ class Database:
         values.append(job_id)
         self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
 
+    def update_metadata(
+        self,
+        job_id: int,
+        *,
+        reason_code: str | None | object = _UNSET,
+        transfer_route: str | None | object = _UNSET,
+        media_manifest: list[dict[str, Any]] | None | object = _UNSET,
+        remote_uri: str | None | object = _UNSET,
+        writer_identity: str | None | object = _UNSET,
+        upload_limit_bytes: int | None | object = _UNSET,
+    ) -> None:
+        fields = ["updated_at = ?"]
+        values: list[Any] = [utc_now()]
+        self._append_metadata_updates(
+            fields,
+            values,
+            reason_code=reason_code,
+            transfer_route=transfer_route,
+            media_manifest=media_manifest,
+            remote_uri=remote_uri,
+            writer_identity=writer_identity,
+            upload_limit_bytes=upload_limit_bytes,
+        )
+        if len(fields) == 1:
+            return
+        values.append(job_id)
+        self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
+
     @staticmethod
     def _append_metadata_updates(
         fields: list[str],

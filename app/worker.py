@@ -57,6 +57,12 @@ class Worker:
             self.logger.info("Stopping after current job batch")
 
     async def _process_one(self, job: MessageJob, stop_event: asyncio.Event) -> None:
+        if self.uploader.writer_capabilities:
+            self.queue.record_writer(
+                job.id,
+                self.uploader.writer_capabilities.identity,
+                self.uploader.writer_capabilities.max_upload_bytes,
+            )
         attempts = self.queue.start_attempt(job)
         if self.logger:
             self.logger.info("Processing job %s attempt %s", job.id, attempts)
@@ -71,7 +77,12 @@ class Worker:
                 if self.logger:
                     self.logger.info("Job %s copied to %s", job.id, result.dest_message_ids or "destination")
             elif result.status == "skipped":
-                self.queue.mark_skipped(job.id, result.reason, reason_code=result.reason_code)
+                self.queue.mark_skipped(
+                    job.id,
+                    result.reason,
+                    reason_code=result.reason_code,
+                    transfer_route=result.transfer_route,
+                )
                 if self.logger:
                     self.logger.info("Job %s skipped: %s", job.id, result.reason)
             else:

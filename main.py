@@ -11,6 +11,7 @@ from app.queue import MessageQueue
 from app.scanner import Scanner
 from app.telegram_client import (
     TelegramLimiter,
+    get_writer_capabilities,
     install_stop_handlers,
     interactive_login,
     make_bot_client,
@@ -61,21 +62,45 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
 
             bot = make_bot_client(config)
             writer = reader
+            writer_me = me
             if bot and config.telegram.use_bot_for_uploads:
                 writer = bot
                 await stack.enter_async_context(writer)
                 bot_me = await limiter.call("read", writer.get_me)
+                writer_me = bot_me
                 logger.info("Writer bot: %s (%s)", bot_me.first_name, bot_me.id)
+
+            writer_capabilities = get_writer_capabilities(config, writer_me)
+            logger.info(
+                "Writer %s has a %s MiB local upload limit",
+                writer_capabilities.identity,
+                writer_capabilities.max_upload_bytes // (1024 * 1024),
+            )
 
             if config.telegram.load_dialogs_on_start:
                 logger.info("Dialog cache warmup skipped; chats are resolved directly through the limiter")
 
             if command in {"scan", "run"}:
-                scanner = Scanner(config, queue, reader, limiter, writer=writer, logger=logger)
+                scanner = Scanner(
+                    config,
+                    queue,
+                    reader,
+                    limiter,
+                    writer=writer,
+                    writer_capabilities=writer_capabilities,
+                    logger=logger,
+                )
                 await scanner.scan(stop_event)
 
             if command in {"process", "run"} and not stop_event.is_set():
-                uploader = Uploader(config, reader, writer, limiter, logger=logger)
+                uploader = Uploader(
+                    config,
+                    reader,
+                    writer,
+                    limiter,
+                    logger=logger,
+                    writer_capabilities=writer_capabilities,
+                )
                 worker = Worker(config, queue, uploader, logger=logger)
                 await worker.run(stop_event)
 

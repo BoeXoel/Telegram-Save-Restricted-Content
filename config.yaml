@@ -33,7 +33,12 @@ transfer:
   hide_sender: true
   drop_caption: false
   save_to_local: false
+  # 0 uses the sending account's Telegram limit: 2,000 MiB for bots and
+  # ordinary users, 4,000 MiB for Premium users.
+  max_upload_bytes: 0
   max_bot_upload_bytes: 2097152000
+  # Unknown-size media is recorded as skipped instead of being downloaded.
+  allow_download_unknown_size: false
 
   native_copy:
     enabled: true

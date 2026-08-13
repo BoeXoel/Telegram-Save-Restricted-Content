@@ -19,6 +19,7 @@ from app.telegram_client import (
     message_media_type,
     message_unique_key,
     resolve_chat,
+    WriterCapabilities,
 )
 
 
@@ -30,12 +31,14 @@ class Scanner:
         reader: Client,
         limiter: TelegramLimiter,
         writer: Client | None = None,
+        writer_capabilities: WriterCapabilities | None = None,
         logger: Any | None = None,
     ) -> None:
         self.config = config
         self.queue = queue
         self.reader = reader
         self.writer = writer
+        self.writer_capabilities = writer_capabilities
         self.limiter = limiter
         self.logger = logger
         self.content_filter = ContentFilter(config.filters)
@@ -120,7 +123,7 @@ class Scanner:
             unique_key = self._group_unique_key(resolved_source.chat_id, group)
             media_type = self._group_media_type(group)
             source_message_ids = [msg.id for msg in group]
-            file_size = sum(message_file_size(msg) or 0 for msg in group) or None
+            file_size = self._group_file_size(group)
             caption = message_caption(first)
             if caption and len(caption) > 1000:
                 caption = caption[:1000]
@@ -141,6 +144,13 @@ class Scanner:
                     status=status,
                     last_error=self._skip_reason(filter_match, group) if not processable else None,
                     reason_code=filter_match.reason_code if filter_match else None,
+                    media_manifest=self._group_media_manifest(group),
+                    writer_identity=(
+                        self.writer_capabilities.identity if self.writer_capabilities else None
+                    ),
+                    upload_limit_bytes=(
+                        self.writer_capabilities.max_upload_bytes if self.writer_capabilities else None
+                    ),
                 )
                 if inserted and status == "pending":
                     added += 1
@@ -189,6 +199,26 @@ class Scanner:
         if len(types) == 1:
             return next(iter(types))
         return "album"
+
+    def _group_file_size(self, messages: list[Message]) -> int | None:
+        sizes = [
+            message_file_size(message)
+            for message in messages
+            if message_media_type(message) != "text"
+        ]
+        if not sizes or any(size is None for size in sizes):
+            return None
+        return sum(size for size in sizes if size is not None)
+
+    def _group_media_manifest(self, messages: list[Message]) -> list[dict[str, Any]]:
+        return [
+            {
+                "message_id": int(message.id),
+                "type": message_media_type(message),
+                "size": message_file_size(message),
+            }
+            for message in messages
+        ]
 
     def _group_unique_key(self, source_chat_id: str, messages: list[Message]) -> str:
         keys = [message_unique_key(message) for message in messages]

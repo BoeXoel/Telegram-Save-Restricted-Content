@@ -17,11 +17,49 @@ from pyrogram.types import Message
 from app.config import AppConfig, ChatSpec
 
 
+BOT_UPLOAD_LIMIT_BYTES = 2_000 * 1024 * 1024
+STANDARD_USER_UPLOAD_LIMIT_BYTES = 2_000 * 1024 * 1024
+PREMIUM_USER_UPLOAD_LIMIT_BYTES = 4_000 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class ResolvedChat:
     chat_id: str
     topic_id: int | None
     title: str
+
+
+@dataclass(frozen=True)
+class WriterCapabilities:
+    """Upload limits for the account that will actually send a local file."""
+
+    identity: str
+    account_type: str
+    is_premium: bool
+    max_upload_bytes: int
+
+
+def get_writer_capabilities(config: AppConfig, account: Any) -> WriterCapabilities:
+    is_bot = bool(getattr(account, "is_bot", False))
+    is_premium = bool(getattr(account, "is_premium", False)) and not is_bot
+    account_id = getattr(account, "id", "unknown")
+
+    if config.transfer.max_upload_bytes:
+        limit = config.transfer.max_upload_bytes
+    elif is_bot:
+        limit = config.transfer.max_bot_upload_bytes or BOT_UPLOAD_LIMIT_BYTES
+    elif is_premium:
+        limit = PREMIUM_USER_UPLOAD_LIMIT_BYTES
+    else:
+        limit = STANDARD_USER_UPLOAD_LIMIT_BYTES
+
+    account_type = "bot" if is_bot else "premium_user" if is_premium else "user"
+    return WriterCapabilities(
+        identity=f"{account_type}:{account_id}",
+        account_type=account_type,
+        is_premium=is_premium,
+        max_upload_bytes=limit,
+    )
 
 
 class TelegramLimiter:
@@ -192,7 +230,16 @@ def message_media_type(message: Message) -> str:
 
 def message_file_size(message: Message) -> int | None:
     media = _message_media_object(message)
-    return int(getattr(media, "file_size", 0) or 0) if media else None
+    if media is None:
+        return None
+    size = getattr(media, "file_size", None)
+    if size is None:
+        return None
+    try:
+        parsed = int(size)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def message_unique_key(message: Message) -> str:

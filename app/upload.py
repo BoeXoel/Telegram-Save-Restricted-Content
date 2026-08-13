@@ -24,6 +24,7 @@ from app.filters import ContentFilter, FilterMatch
 from app.queue import MessageJob
 from app.telegram_client import (
     TelegramLimiter,
+    WriterCapabilities,
     message_caption,
     message_file_size,
     message_is_empty,
@@ -40,6 +41,7 @@ class UploadResult:
     dest_message_ids: list[int] = field(default_factory=list)
     reason: str = ""
     reason_code: str | None = None
+    transfer_route: str | None = None
 
 
 class Uploader:
@@ -50,12 +52,14 @@ class Uploader:
         writer: Client,
         limiter: TelegramLimiter,
         logger: Any | None = None,
+        writer_capabilities: WriterCapabilities | None = None,
     ) -> None:
         self.config = config
         self.reader = reader
         self.writer = writer
         self.limiter = limiter
         self.logger = logger
+        self.writer_capabilities = writer_capabilities
         self.content_filter = ContentFilter(config.filters)
 
     async def process(
@@ -121,7 +125,11 @@ class Uploader:
             entities=message.entities or message.caption_entities,
             **self._destination_kwargs(job),
         )
-        return UploadResult(status="copied", dest_message_ids=self._result_message_ids(result))
+        return UploadResult(
+            status="copied",
+            dest_message_ids=self._result_message_ids(result),
+            transfer_route="telegram",
+        )
 
     async def _load_source_messages(self, job: MessageJob) -> list[Message]:
         result = await self.limiter.call(
@@ -177,7 +185,11 @@ class Uploader:
                 message_ids=[msg.id for msg in messages],
             )
 
-        return UploadResult(status="copied", dest_message_ids=self._result_message_ids(result))
+        return UploadResult(
+            status="copied",
+            dest_message_ids=self._result_message_ids(result),
+            transfer_route="telegram",
+        )
 
     async def _download_and_upload(
         self,
@@ -186,6 +198,10 @@ class Uploader:
         stop_event: asyncio.Event,
         on_phase: PhaseCallback,
     ) -> UploadResult:
+        validation_result = self._validate_downloadable_messages(job, messages)
+        if validation_result:
+            return validation_result
+
         job_dir = self.config.downloads.active_dir / f"job-{job.id}"
         job_dir.mkdir(parents=True, exist_ok=True)
         downloaded: list[tuple[Message, Path]] = []
@@ -194,7 +210,6 @@ class Uploader:
         try:
             await on_phase("downloading")
             for message in messages:
-                self._validate_bot_upload_size(message)
                 path = await self._download_one(message, job_dir)
                 downloaded.append((message, path))
 
@@ -250,7 +265,11 @@ class Uploader:
                 media=media_group,
                 **kwargs,
             )
-            return UploadResult(status="copied", dest_message_ids=self._result_message_ids(result))
+            return UploadResult(
+                status="copied",
+                dest_message_ids=self._result_message_ids(result),
+                transfer_route="telegram",
+            )
 
         message, path = downloaded[0]
         caption = self._caption_for(message)
@@ -297,7 +316,11 @@ class Uploader:
                 **kwargs,
             )
 
-        return UploadResult(status="copied", dest_message_ids=self._result_message_ids(result))
+        return UploadResult(
+            status="copied",
+            dest_message_ids=self._result_message_ids(result),
+            transfer_route="telegram",
+        )
 
     def _destination_kwargs(self, job: MessageJob) -> dict[str, Any]:
         if job.dest_topic_id:
@@ -324,15 +347,51 @@ class Uploader:
     def _filter_match(self, messages: list[Message]) -> FilterMatch | None:
         return self.content_filter.match_texts(message_caption(message) for message in messages)
 
-    def _validate_bot_upload_size(self, message: Message) -> None:
-        if self.writer is self.reader:
-            return
-        size = message_file_size(message)
-        if size and size > self.config.transfer.max_bot_upload_bytes:
-            raise PermanentJobError(
-                f"File is {size} bytes, above configured bot upload limit "
-                f"{self.config.transfer.max_bot_upload_bytes}"
-            )
+    def _validate_downloadable_messages(
+        self,
+        job: MessageJob,
+        messages: list[Message],
+    ) -> UploadResult | None:
+        identity, limit = self._writer_upload_limit()
+        for message in messages:
+            if message_media_type(message) == "text":
+                continue
+
+            size = message_file_size(message)
+            source = f"source chat {job.source_chat_id}, message {message.id}"
+            if size is None:
+                if not self.config.transfer.allow_download_unknown_size:
+                    return UploadResult(
+                        status="skipped",
+                        reason=(
+                            f"File size is unknown for {source}; local download is disabled "
+                            "by transfer.allow_download_unknown_size"
+                        ),
+                        reason_code="unknown_size",
+                        transfer_route="record",
+                    )
+                continue
+
+            if size > limit:
+                return UploadResult(
+                    status="skipped",
+                    reason=(
+                        f"File for {source} is {size} bytes, above the {limit}-byte "
+                        f"upload limit for {identity}"
+                    ),
+                    reason_code="oversized",
+                    transfer_route="record",
+                )
+        return None
+
+    def _writer_upload_limit(self) -> tuple[str, int]:
+        if self.writer_capabilities:
+            return self.writer_capabilities.identity, self.writer_capabilities.max_upload_bytes
+
+        # This fallback is intentionally conservative for callers using the
+        # Uploader directly instead of main.py, where capabilities are known.
+        override = self.config.transfer.max_upload_bytes
+        return "unknown_writer", override or self.config.transfer.max_bot_upload_bytes
 
     def _cleanup_job_dir(self, job_dir: Path, success: bool) -> None:
         if not job_dir.exists():
