@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Telegram media migration queue periodically
+
+[Timer]
+OnCalendar=*:0/30
+RandomizedDelaySec=5m
+Persistent=true
+Unit=telegram-save.service
+
+[Install]
+WantedBy=timers.target

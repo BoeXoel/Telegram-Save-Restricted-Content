@@ -1,0 +1,18 @@
+[Unit]
+Description=One-shot Telegram media migration queue processor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=telegram-save
+Group=telegram-save
+WorkingDirectory=/srv/telegram-save
+EnvironmentFile=/etc/telegram-save.env
+UMask=0077
+
+# Edit every absolute path and account name above for this host. flock prevents
+# concurrent use of the same Pyrogram session and SQLite queue database.
+ExecStart=/usr/bin/flock -n /srv/telegram-save/data/telegram-save.lock /srv/telegram-save/.venv/bin/python main.py process --config /srv/telegram-save/config.yaml
+
+# Deliberately no Restart=always: this command processes one batch/run and exits.
