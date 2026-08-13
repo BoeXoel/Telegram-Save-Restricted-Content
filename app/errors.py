@@ -61,6 +61,11 @@ class RemoteTransferError(RetryableJobError):
         super().__init__(message, reason_code="remote_error")
 
 
+class TopicDeliveryError(PermanentJobError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason_code="topic_error")
+
+
 def compact_error(exc: BaseException) -> str:
     message = f"{exc.__class__.__name__}: {exc}"
     return " ".join(message.split())[:4000]

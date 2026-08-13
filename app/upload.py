@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import random
 import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from pyrogram import Client
+from pyrogram import Client, raw
 from pyrogram.errors import (
     BadRequest,
     ChannelInvalid,
@@ -26,6 +27,7 @@ from app.errors import (
     JobSizeLimitError,
     PermanentJobError,
     RetryableJobError,
+    TopicDeliveryError,
 )
 from app.filters import ContentFilter, FilterMatch
 from app.offload import RemoteOffloader
@@ -139,6 +141,7 @@ class Uploader:
             entities=message.entities or message.caption_entities,
             **self._destination_kwargs(job),
         )
+        await self._ensure_topic_delivery(job, result)
         return UploadResult(
             status="copied",
             dest_message_ids=self._result_message_ids(result),
@@ -161,35 +164,29 @@ class Uploader:
             return False
         if self.writer is not self.reader:
             return False
-        if not self.config.transfer.hide_sender and job.dest_topic_id:
-            return False
         return True
 
     async def _copy_or_forward(self, job: MessageJob, messages: list[Message]) -> UploadResult:
-        kwargs = self._destination_kwargs(job)
-        first = messages[0]
-
         if self.config.transfer.hide_sender:
-            if len(messages) > 1 and first.media_group_id:
-                result = await self.limiter.call(
-                    "copy",
-                    self.writer.copy_media_group,
-                    chat_id=job.dest_chat_id,
-                    from_chat_id=job.source_chat_id,
-                    message_id=first.id,
-                    captions="" if self.config.transfer.drop_caption else None,
-                    **kwargs,
-                )
-            else:
-                result = await self.limiter.call(
-                    "copy",
-                    self.writer.copy_message,
-                    chat_id=job.dest_chat_id,
-                    from_chat_id=job.source_chat_id,
-                    message_id=first.id,
-                    caption="" if self.config.transfer.drop_caption else None,
-                    **kwargs,
-                )
+            result = await self._copy_messages(job, messages)
+        elif job.dest_topic_id or self.config.transfer.drop_caption:
+            try:
+                return await self._raw_forward(job, messages)
+            except Exception as forward_error:
+                if not job.dest_topic_id:
+                    raise
+                if self.logger:
+                    self.logger.warning(
+                        "Raw topic forward failed for job %s; trying copy fallback: %s",
+                        job.id,
+                        forward_error,
+                    )
+                try:
+                    result = await self._copy_messages(job, messages)
+                except Exception as copy_error:
+                    raise TopicDeliveryError(
+                        "Unable to forward or copy the message into the configured forum topic"
+                    ) from copy_error
         else:
             result = await self.limiter.call(
                 "copy",
@@ -199,9 +196,83 @@ class Uploader:
                 message_ids=[msg.id for msg in messages],
             )
 
+        await self._ensure_topic_delivery(job, result)
+
         return UploadResult(
             status="copied",
             dest_message_ids=self._result_message_ids(result),
+            transfer_route="telegram",
+        )
+
+    async def _copy_messages(self, job: MessageJob, messages: list[Message]) -> Any:
+        kwargs = self._destination_kwargs(job)
+        first = messages[0]
+        if len(messages) > 1 and first.media_group_id:
+            result = await self.limiter.call(
+                "copy",
+                self.writer.copy_media_group,
+                chat_id=job.dest_chat_id,
+                from_chat_id=job.source_chat_id,
+                message_id=first.id,
+                captions="" if self.config.transfer.drop_caption else None,
+                **kwargs,
+            )
+        else:
+            result = await self.limiter.call(
+                "copy",
+                self.writer.copy_message,
+                chat_id=job.dest_chat_id,
+                from_chat_id=job.source_chat_id,
+                message_id=first.id,
+                caption="" if self.config.transfer.drop_caption else None,
+                **kwargs,
+            )
+        await self._ensure_topic_delivery(job, result)
+        return result
+
+    async def _raw_forward(self, job: MessageJob, messages: list[Message]) -> UploadResult:
+        from_peer = await self.limiter.call(
+            "copy",
+            self.writer.resolve_peer,
+            self._peer_id(job.source_chat_id),
+        )
+        to_peer = await self.limiter.call(
+            "copy",
+            self.writer.resolve_peer,
+            self._peer_id(job.dest_chat_id),
+        )
+        request = raw.functions.messages.ForwardMessages(
+            from_peer=from_peer,
+            id=[int(message.id) for message in messages],
+            random_id=self._random_ids(len(messages)),
+            to_peer=to_peer,
+            drop_media_captions=True if self.config.transfer.drop_caption else None,
+            top_msg_id=job.dest_topic_id,
+        )
+        updates = await self.limiter.call("copy", self.writer.invoke, request)
+        forwarded = [
+            update.message
+            for update in getattr(updates, "updates", [])
+            if isinstance(
+                update,
+                (
+                    raw.types.UpdateNewMessage,
+                    raw.types.UpdateNewChannelMessage,
+                    raw.types.UpdateNewScheduledMessage,
+                ),
+            )
+        ]
+        dest_message_ids = [int(message.id) for message in forwarded if getattr(message, "id", None)]
+        if not dest_message_ids:
+            raise TopicDeliveryError("Telegram did not return destination messages for the raw forward")
+        if job.dest_topic_id and not all(
+            self._raw_message_is_in_topic(message, job.dest_topic_id) for message in forwarded
+        ):
+            await self._cleanup_misplaced_messages(job, dest_message_ids)
+            raise TopicDeliveryError("Raw forward did not arrive in the configured forum topic")
+        return UploadResult(
+            status="copied",
+            dest_message_ids=dest_message_ids,
             transfer_route="telegram",
         )
 
@@ -450,6 +521,7 @@ class Uploader:
                 media=media_group,
                 **kwargs,
             )
+            await self._ensure_topic_delivery(job, result)
             return UploadResult(
                 status="copied",
                 dest_message_ids=self._result_message_ids(result),
@@ -501,6 +573,7 @@ class Uploader:
                 **kwargs,
             )
 
+        await self._ensure_topic_delivery(job, result)
         return UploadResult(
             status="copied",
             dest_message_ids=self._result_message_ids(result),
@@ -511,6 +584,60 @@ class Uploader:
         if job.dest_topic_id:
             return {"reply_to_message_id": job.dest_topic_id}
         return {}
+
+    async def _ensure_topic_delivery(self, job: MessageJob, result: Any) -> None:
+        if not job.dest_topic_id:
+            return
+        messages = result if isinstance(result, list) else [result]
+        message_ids = self._result_message_ids(result)
+        if messages and all(self._message_is_in_topic(message, job.dest_topic_id) for message in messages):
+            return
+        await self._cleanup_misplaced_messages(job, message_ids)
+        raise TopicDeliveryError("Destination message did not arrive in the configured forum topic")
+
+    async def _cleanup_misplaced_messages(self, job: MessageJob, message_ids: list[int]) -> None:
+        if not message_ids:
+            return
+        delete_messages = getattr(self.writer, "delete_messages", None)
+        if not callable(delete_messages):
+            return
+        try:
+            await self.limiter.call("copy", delete_messages, job.dest_chat_id, message_ids)
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(
+                    "Could not remove misplaced topic messages for job %s: %s",
+                    job.id,
+                    exc,
+                )
+
+    @staticmethod
+    def _message_is_in_topic(message: Any, topic_id: int) -> bool:
+        reply_to = getattr(message, "reply_to", None)
+        topic_values = {
+            getattr(message, "reply_to_top_message_id", None),
+            getattr(message, "reply_to_message_id", None),
+            getattr(reply_to, "reply_to_top_id", None),
+            getattr(reply_to, "reply_to_msg_id", None),
+        }
+        return topic_id in topic_values
+
+    @classmethod
+    def _raw_message_is_in_topic(cls, message: Any, topic_id: int) -> bool:
+        return cls._message_is_in_topic(message, topic_id)
+
+    def _random_ids(self, count: int) -> list[int]:
+        random_id = getattr(self.writer, "rnd_id", None)
+        if callable(random_id):
+            return [int(random_id()) for _ in range(count)]
+        return [random.getrandbits(63) for _ in range(count)]
+
+    @staticmethod
+    def _peer_id(value: str) -> int | str:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
 
     def _caption_for(self, message: Message) -> str | None:
         if self.config.transfer.drop_caption:
