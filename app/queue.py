@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
+from typing import Any
 
 from app.config import AppConfig
 from app.db import Database, utc_now
@@ -28,6 +29,12 @@ class MessageJob:
     media_type: str
     file_size: int | None
     caption: str | None
+    reason_code: str | None
+    transfer_route: str | None
+    media_manifest: list[dict[str, Any]]
+    remote_uri: str | None
+    writer_identity: str | None
+    upload_limit_bytes: int | None
 
     @classmethod
     def from_row(cls, row: Row) -> "MessageJob":
@@ -49,7 +56,23 @@ class MessageJob:
             media_type=str(row["media_type"] or "unsupported"),
             file_size=row["file_size"],
             caption=row["caption"],
+            reason_code=row["reason_code"],
+            transfer_route=row["transfer_route"],
+            media_manifest=_decode_manifest(row["media_manifest"]),
+            remote_uri=row["remote_uri"],
+            writer_identity=row["writer_identity"],
+            upload_limit_bytes=row["upload_limit_bytes"],
         )
+
+
+def _decode_manifest(value: str | None) -> list[dict[str, Any]]:
+    if not value:
+        return []
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return decoded if isinstance(decoded, list) else []
 
 
 class MessageQueue:
@@ -73,6 +96,12 @@ class MessageQueue:
         caption: str | None,
         status: str = "pending",
         last_error: str | None = None,
+        reason_code: str | None = None,
+        transfer_route: str | None = None,
+        media_manifest: list[dict[str, Any]] | None = None,
+        remote_uri: str | None = None,
+        writer_identity: str | None = None,
+        upload_limit_bytes: int | None = None,
     ) -> bool:
         return self.db.enqueue_message(
             source_chat_id=source_chat_id,
@@ -88,6 +117,12 @@ class MessageQueue:
             caption=caption,
             status=status,
             last_error=last_error,
+            reason_code=reason_code,
+            transfer_route=transfer_route,
+            media_manifest=media_manifest,
+            remote_uri=remote_uri,
+            writer_identity=writer_identity,
+            upload_limit_bytes=upload_limit_bytes,
         )
 
     def fetch_due(self, limit: int) -> list[MessageJob]:
@@ -105,10 +140,16 @@ class MessageQueue:
         self.db.set_status(job_id, status)
 
     def mark_copied(self, job_id: int, dest_message_ids: list[int]) -> None:
-        self.db.set_status(job_id, "copied", last_error="", dest_message_ids=dest_message_ids)
+        self.db.set_status(
+            job_id,
+            "copied",
+            last_error="",
+            dest_message_ids=dest_message_ids,
+            reason_code=None,
+        )
 
-    def mark_skipped(self, job_id: int, reason: str) -> None:
-        self.db.set_status(job_id, "skipped", last_error=reason)
+    def mark_skipped(self, job_id: int, reason: str, *, reason_code: str | None = None) -> None:
+        self.db.set_status(job_id, "skipped", last_error=reason, reason_code=reason_code)
 
     def mark_verified(self, job_id: int) -> None:
         self.db.set_status(job_id, "copied", verified_at=utc_now())
@@ -134,4 +175,3 @@ class MessageQueue:
             return 300
         index = min(max(attempts - 1, 0), len(self.config.queue.retry_backoff_seconds) - 1)
         return self.config.queue.retry_backoff_seconds[index]
-

@@ -8,6 +8,19 @@ from typing import Any, Iterable
 
 
 STATUSES = {"pending", "downloading", "uploading", "copied", "failed", "skipped"}
+_UNSET = object()
+
+
+# These columns are deliberately additive.  Existing users keep their queue
+# database between releases, so schema changes must never require a rebuild.
+MESSAGE_ADDITIVE_COLUMNS = {
+    "reason_code": "TEXT",
+    "transfer_route": "TEXT",
+    "media_manifest": "TEXT",
+    "remote_uri": "TEXT",
+    "writer_identity": "TEXT",
+    "upload_limit_bytes": "INTEGER",
+}
 
 
 def utc_now() -> str:
@@ -50,7 +63,13 @@ class Database:
                 media_type TEXT,
                 file_size INTEGER,
                 caption TEXT,
-                verified_at TEXT
+                verified_at TEXT,
+                reason_code TEXT,
+                transfer_route TEXT,
+                media_manifest TEXT,
+                remote_uri TEXT,
+                writer_identity TEXT,
+                upload_limit_bytes INTEGER
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_job
@@ -61,7 +80,27 @@ class Database:
                 ON messages(source_chat_id, source_message_id);
             """
         )
+        self._migrate_message_columns()
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_reason ON messages(status, reason_code)"
+        )
         self.conn.commit()
+
+    def _migrate_message_columns(self) -> None:
+        """Add optional fields introduced after the first queue schema.
+
+        SQLite's ``CREATE TABLE IF NOT EXISTS`` does not update existing
+        tables.  Keep this migration intentionally small and idempotent so an
+        older ``data/queue.sqlite3`` starts normally after an upgrade.
+        """
+
+        existing_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(messages)")
+        }
+        for column, definition in MESSAGE_ADDITIVE_COLUMNS.items():
+            if column not in existing_columns:
+                self.conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         cursor = self.conn.execute(sql, tuple(params))
@@ -87,6 +126,12 @@ class Database:
         caption: str | None,
         status: str = "pending",
         last_error: str | None = None,
+        reason_code: str | None = None,
+        transfer_route: str | None = None,
+        media_manifest: list[dict[str, Any]] | None = None,
+        remote_uri: str | None = None,
+        writer_identity: str | None = None,
+        upload_limit_bytes: int | None = None,
     ) -> bool:
         if status not in STATUSES:
             raise ValueError(f"Invalid message status: {status}")
@@ -98,9 +143,10 @@ class Database:
                 source_chat_id, source_message_id, dest_chat_id, status, attempts,
                 last_error, next_retry_at, file_unique_key, created_at, updated_at,
                 source_topic_id, dest_topic_id, media_group_id, source_message_ids,
-                media_type, file_size, caption
+                media_type, file_size, caption, reason_code, transfer_route,
+                media_manifest, remote_uri, writer_identity, upload_limit_bytes
             )
-            VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_chat_id,
@@ -118,6 +164,12 @@ class Database:
                 media_type,
                 file_size,
                 caption,
+                reason_code,
+                transfer_route,
+                json.dumps(media_manifest) if media_manifest is not None else None,
+                remote_uri,
+                writer_identity,
+                upload_limit_bytes,
             ),
         )
         self.conn.commit()
@@ -132,6 +184,12 @@ class Database:
         next_retry_at: str | None = None,
         dest_message_ids: list[int] | None = None,
         verified_at: str | None = None,
+        reason_code: str | None | object = _UNSET,
+        transfer_route: str | None | object = _UNSET,
+        media_manifest: list[dict[str, Any]] | None | object = _UNSET,
+        remote_uri: str | None | object = _UNSET,
+        writer_identity: str | None | object = _UNSET,
+        upload_limit_bytes: int | None | object = _UNSET,
     ) -> None:
         if status not in STATUSES:
             raise ValueError(f"Invalid message status: {status}")
@@ -151,9 +209,34 @@ class Database:
         if verified_at is not None:
             fields.append("verified_at = ?")
             values.append(verified_at)
+        self._append_metadata_updates(
+            fields,
+            values,
+            reason_code=reason_code,
+            transfer_route=transfer_route,
+            media_manifest=media_manifest,
+            remote_uri=remote_uri,
+            writer_identity=writer_identity,
+            upload_limit_bytes=upload_limit_bytes,
+        )
 
         values.append(job_id)
         self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
+
+    @staticmethod
+    def _append_metadata_updates(
+        fields: list[str],
+        values: list[Any],
+        **metadata: Any,
+    ) -> None:
+        for column, value in metadata.items():
+            if value is _UNSET:
+                continue
+            fields.append(f"{column} = ?")
+            if column == "media_manifest" and value is not None:
+                values.append(json.dumps(value))
+            else:
+                values.append(value)
 
     def increment_attempt(self, job_id: int) -> int:
         now = utc_now()
@@ -210,4 +293,3 @@ class Database:
     def counts_by_status(self) -> dict[str, int]:
         rows = self.query("SELECT status, COUNT(*) AS count FROM messages GROUP BY status")
         return {str(row["status"]): int(row["count"]) for row in rows}
-
