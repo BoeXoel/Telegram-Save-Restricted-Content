@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 from pyrogram import Client
+from pyrogram.errors import PeerIdInvalid
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
@@ -18,6 +19,7 @@ from app.telegram_client import (
     message_is_empty,
     message_media_type,
     message_unique_key,
+    require_bot_destination_id,
     resolve_chat,
     WriterCapabilities,
 )
@@ -55,23 +57,26 @@ class Scanner:
 
     async def _resolve_destinations(self) -> list[ResolvedChat]:
         resolved: list[ResolvedChat] = []
+        writer = self.writer or self.reader
+        writer_is_bot = bool(
+            self.writer_capabilities and self.writer_capabilities.account_type == "bot"
+        )
+
         for spec in self.config.destinations:
+            if writer_is_bot:
+                require_bot_destination_id(spec.chat)
             try:
-                resolved.append(await resolve_chat(self.reader, self.limiter, spec))
-                continue
+                resolved.append(await resolve_chat(writer, self.limiter, spec))
+            except PeerIdInvalid as exc:
+                raise ValueError(
+                    f"Writer could not resolve destination {spec.chat}: the peer is not known to its session. "
+                    "Run `python main.py warmup-bot` when the writer is a Bot, then scan again."
+                ) from exc
             except Exception as exc:
-                if self.logger:
-                    self.logger.warning("Reader could not resolve destination %s: %s", spec.chat, exc)
-
-            if self.writer and self.writer is not self.reader:
-                try:
-                    resolved.append(await resolve_chat(self.writer, self.limiter, spec))
-                    continue
-                except Exception as exc:
-                    if self.logger:
-                        self.logger.warning("Writer could not resolve destination %s: %s", spec.chat, exc)
-
-            resolved.append(ResolvedChat(chat_id=str(spec.chat), topic_id=spec.topic_id, title=str(spec.chat)))
+                raise ValueError(
+                    f"Writer could not resolve destination {spec.chat}: {exc}. "
+                    "Check the target ID, membership, and posting permission before scanning."
+                ) from exc
 
         return resolved
 

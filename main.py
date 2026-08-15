@@ -21,6 +21,8 @@ from app.telegram_client import (
     make_bot_client,
     make_user_client,
     update_account_cache,
+    warmup_bot_destinations,
+    warmup_user_dialogs,
 )
 from app.upload import Uploader
 from app.worker import Verifier, Worker
@@ -30,7 +32,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Queue-based Telegram migration tool")
     parser.add_argument(
         "command",
-        choices=("login", "scan", "process", "verify", "run", "stats", "recover", "report-oversized"),
+        choices=(
+            "login",
+            "warmup-bot",
+            "scan",
+            "process",
+            "verify",
+            "run",
+            "stats",
+            "recover",
+            "report-oversized",
+        ),
         help="Phase to run",
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
@@ -41,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         help="Process only known oversized jobs (valid with the process command)",
     )
     parser.add_argument("--csv", help="Write report-oversized rows to this CSV file")
+    parser.add_argument(
+        "--warmup-timeout",
+        type=int,
+        default=120,
+        help="Seconds warmup-bot waits for a Bot update in each unresolved destination",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +111,9 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
             logger.info("Reader session: %s (%s)", me.first_name, me.id)
             reader_capabilities = get_writer_capabilities(config, me)
 
+            if config.telegram.load_dialogs_on_start:
+                await warmup_user_dialogs(reader, logger)
+
             bot = make_bot_client(config)
             writer = reader
             writer_me = me
@@ -128,9 +149,6 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
                 logger.warning(
                     "Premium reader fallback is enabled but no eligible Premium reader/bot combination is active"
                 )
-
-            if config.telegram.load_dialogs_on_start:
-                logger.info("Dialog cache warmup skipped; chats are resolved directly through the limiter")
 
             if command in {"scan", "run"}:
                 scanner = Scanner(
@@ -181,6 +199,8 @@ async def async_main() -> None:
         raise ValueError("--oversized-only can only be used with the process command")
     if args.csv and args.command != "report-oversized":
         raise ValueError("--csv can only be used with the report-oversized command")
+    if args.warmup_timeout <= 0:
+        raise ValueError("--warmup-timeout must be greater than zero")
     config = load_config(args.config)
     config.ensure_directories()
 
@@ -188,11 +208,42 @@ async def async_main() -> None:
         await interactive_login(config, args.session)
         return
 
+    if args.command == "warmup-bot":
+        await run_bot_warmup(config, args.warmup_timeout)
+        return
+
     if args.command == "report-oversized" and args.csv:
         await write_oversized_csv(config, args.csv)
         return
 
     await run_with_clients(config, args.command, oversized_only=args.oversized_only)
+
+
+async def run_bot_warmup(config: AppConfig, timeout_seconds: int) -> None:
+    if not config.telegram.bot_enabled or not config.telegram.use_bot_for_uploads:
+        raise ValueError(
+            "warmup-bot requires telegram.bot.enabled: true and telegram.bot.use_for_uploads: true"
+        )
+
+    logger = setup_logging(config.logging)
+    limiter = TelegramLimiter(config, logger)
+    bot = make_bot_client(config)
+    if bot is None:
+        raise ValueError("warmup-bot requires a configured Bot token")
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(bot)
+        bot_me = await limiter.call("read", bot.get_me)
+        logger.info("Warming Bot session: %s (%s)", bot_me.first_name, bot_me.id)
+        resolved = await warmup_bot_destinations(
+            bot,
+            config.destinations,
+            limiter,
+            timeout_seconds=timeout_seconds,
+            bot_username=getattr(bot_me, "username", None),
+            logger=logger,
+        )
+        logger.info("Bot peer warmup complete: %s destination(s) ready", len(resolved))
 
 
 async def write_oversized_csv(config: AppConfig, csv_path: str) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import signal
 import time
 from dataclasses import dataclass
@@ -11,7 +12,14 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from pyrogram import Client
-from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded
+from pyrogram.errors import (
+    FloodWait,
+    PeerIdInvalid,
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    SessionPasswordNeeded,
+)
+from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
@@ -21,6 +29,11 @@ from app.errors import FloodWaitDeferred
 BOT_UPLOAD_LIMIT_BYTES = 2_000 * 1024 * 1024
 STANDARD_USER_UPLOAD_LIMIT_BYTES = 2_000 * 1024 * 1024
 PREMIUM_USER_UPLOAD_LIMIT_BYTES = 4_000 * 1024 * 1024
+_NUMERIC_CHAT_ID_RE = re.compile(r"^-?\d+$")
+_PRIVATE_INVITE_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +52,37 @@ class WriterCapabilities:
     is_premium: bool
     max_upload_bytes: int
     account_id: int | str = "unknown"
+
+
+def telegram_chat_id(value: int | str) -> int | str:
+    """Convert configured numeric chat IDs back to ints for Pyrogram calls.
+
+    Queue rows intentionally keep chat IDs as text, but Pyrogram treats an
+    unknown numeric *string* as a phone number.  Passing an int preserves the
+    normal channel/group peer resolution path.
+    """
+
+    text = str(value).strip()
+    if _NUMERIC_CHAT_ID_RE.fullmatch(text):
+        return int(text)
+    return text
+
+
+def is_private_invite_link(value: int | str) -> bool:
+    """Return whether a value is a private Telegram invite link."""
+
+    return bool(_PRIVATE_INVITE_LINK_RE.match(str(value).strip()))
+
+
+def require_bot_destination_id(value: int | str) -> None:
+    """Reject private invite links before a Bot invokes CheckChatInvite."""
+
+    if is_private_invite_link(value):
+        raise ValueError(
+            "Bot writers cannot use private invite links as destinations. "
+            "Use the target's -100… ID or public @username, add the Bot to the target, "
+            "then run `python main.py warmup-bot`."
+        )
 
 
 def get_writer_capabilities(config: AppConfig, account: Any) -> WriterCapabilities:
@@ -212,8 +256,117 @@ async def interactive_login(config: AppConfig, session_name: str | None = None) 
         await client.disconnect()
 
 
+async def warmup_user_dialogs(client: Client, logger: Any | None = None) -> int:
+    """Populate a user session's peer cache by consuming its dialogs once."""
+
+    count = 0
+    async for _dialog in client.get_dialogs():
+        count += 1
+    if logger:
+        logger.info("Loaded %s dialogs into the user session peer cache", count)
+    return count
+
+
+async def warmup_bot_destinations(
+    bot: Client,
+    destinations: list[ChatSpec],
+    limiter: TelegramLimiter,
+    *,
+    timeout_seconds: int,
+    bot_username: str | None = None,
+    logger: Any | None = None,
+) -> list[ResolvedChat]:
+    """Wait for Bot updates that make configured destination peers known.
+
+    A Bot cannot resolve a private invite link, and an unseen private
+    supergroup ID may not have an access hash in a fresh session.  Incoming
+    updates provide that peer information, so this short-lived command waits
+    for an operator to address the Bot in the target chat.
+    """
+
+    if timeout_seconds <= 0:
+        raise ValueError("warmup timeout must be greater than zero")
+    if not destinations:
+        raise ValueError("No destinations configured for Bot peer warmup")
+
+    for spec in destinations:
+        require_bot_destination_id(spec.chat)
+
+    pending = list(enumerate(destinations))
+    resolved: dict[int, ResolvedChat] = {}
+    update_received = asyncio.Event()
+
+    async def on_message(_client: Client, _message: Message) -> None:
+        update_received.set()
+
+    handler, group = bot.add_handler(MessageHandler(on_message), group=-100)
+    # add_handler schedules its dispatcher update; let it register before we
+    # tell the operator to send the warmup command.
+    await asyncio.sleep(0)
+
+    async def resolve_pending() -> list[tuple[int, ChatSpec]]:
+        remaining: list[tuple[int, ChatSpec]] = []
+        for index, spec in pending:
+            try:
+                resolved[index] = await resolve_chat(bot, limiter, spec)
+                if logger:
+                    logger.info("Bot peer ready: %s", spec.chat)
+            except PeerIdInvalid:
+                remaining.append((index, spec))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Bot could not access destination {spec.chat}: {exc}. "
+                    "Check that the Bot is a member and has permission to post there."
+                ) from exc
+        return remaining
+
+    try:
+        pending = await resolve_pending()
+        if pending and logger:
+            targets = ", ".join(spec.chat for _, spec in pending)
+            command = (
+                f"/warmup@{bot_username.lstrip('@')}"
+                if bot_username
+                else "a command addressed to the Bot"
+            )
+            logger.warning(
+                "Bot has not met destination peer(s): %s. In each target chat, send %s "
+                "within %ss to warm this session.",
+                targets,
+                command,
+                timeout_seconds,
+            )
+
+        deadline = time.monotonic() + timeout_seconds
+        while pending:
+            if update_received.is_set():
+                update_received.clear()
+            else:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(update_received.wait(), timeout=remaining_seconds)
+                except TimeoutError:
+                    break
+                update_received.clear()
+            pending = await resolve_pending()
+
+        if pending:
+            targets = ", ".join(spec.chat for _, spec in pending)
+            raise TimeoutError(
+                f"Bot peer warmup timed out for {targets}. Send a command mentioning the Bot in each target, "
+                "then run `python main.py warmup-bot` again."
+            )
+
+        return [resolved[index] for index in range(len(destinations))]
+    finally:
+        bot.remove_handler(handler, group)
+        await asyncio.sleep(0)
+
+
 async def resolve_chat(client: Client, limiter: TelegramLimiter, spec: ChatSpec) -> ResolvedChat:
-    chat = await limiter.call("resolve", client.get_chat, spec.chat)
+    chat = await limiter.call("resolve", client.get_chat, telegram_chat_id(spec.chat))
     title = chat.title or chat.username or str(chat.id)
     return ResolvedChat(chat_id=str(chat.id), topic_id=spec.topic_id, title=title)
 

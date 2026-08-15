@@ -11,6 +11,7 @@ from pyrogram.errors import (
     ChatWriteForbidden,
     MediaEmpty,
     MessageIdInvalid,
+    PeerIdInvalid,
     PeerFlood,
     UserRestricted,
 )
@@ -19,12 +20,13 @@ from app.config import AppConfig
 from app.errors import (
     AccountRestrictedError,
     DeferredJobError,
+    PeerUnresolvedError,
     PermanentJobError,
     RetryableJobError,
     compact_error,
 )
 from app.queue import MessageJob, MessageQueue
-from app.telegram_client import TelegramLimiter, message_is_empty
+from app.telegram_client import TelegramLimiter, message_is_empty, telegram_chat_id
 from app.upload import Uploader
 
 
@@ -144,6 +146,24 @@ class Worker:
             self.queue.mark_skipped(job.id, compact_error(exc), reason_code="source_missing")
             if self.logger:
                 self.logger.warning("Job %s skipped because the source is unavailable: %s", job.id, exc)
+        except PeerIdInvalid as exc:
+            destination = str(job.dest_chat_id)
+            unresolved = PeerUnresolvedError(destination)
+            self.queue.defer(
+                job,
+                compact_error(unresolved),
+                reason_code=unresolved.reason_code,
+                retry_after_seconds=unresolved.retry_after_seconds,
+            )
+            stop_event.set()
+            if self.logger:
+                self.logger.error(
+                    "Job %s paused: target %s is not known to the writer session (PEER_ID_INVALID). "
+                    "Run `python main.py warmup-bot` for that target, then run process again. Telegram: %s",
+                    job.id,
+                    destination,
+                    exc,
+                )
         except RetryableJobError as exc:
             status = self.queue.mark_failure(
                 job,
@@ -153,10 +173,14 @@ class Worker:
             )
             if self.logger:
                 self.logger.warning("Job %s %s after retryable stop: %s", job.id, status, exc)
-        except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden, BadRequest) as exc:
+        except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden) as exc:
             self.queue.mark_skipped(job.id, compact_error(exc), reason_code="permission_denied")
             if self.logger:
                 self.logger.warning("Job %s skipped by Telegram error: %s", job.id, exc)
+        except BadRequest as exc:
+            self.queue.mark_skipped(job.id, compact_error(exc), reason_code="telegram_bad_request")
+            if self.logger:
+                self.logger.warning("Job %s skipped by Telegram request error: %s", job.id, exc)
         except Exception as exc:
             status = self.queue.mark_failure(job, compact_error(exc), attempts)
             if self.logger:
@@ -197,7 +221,12 @@ class Verifier:
             await sleep_or_stop(stop_event, self.config.batch.pause_between_batches_seconds)
 
     async def _verify_one(self, job: MessageJob) -> None:
-        result = await self.limiter.call("verify", self.client.get_messages, job.dest_chat_id, job.dest_message_ids)
+        result = await self.limiter.call(
+            "verify",
+            self.client.get_messages,
+            telegram_chat_id(job.dest_chat_id),
+            job.dest_message_ids,
+        )
         messages = result if isinstance(result, list) else [result]
         present = [msg for msg in messages if not message_is_empty(msg)]
         if len(present) == len(job.dest_message_ids):

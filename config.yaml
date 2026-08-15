@@ -4,6 +4,8 @@ telegram:
   # Use the same private name with: python main.py login --session my_user
   user_session: "my_user"
   sessions_dir: "sessions"
+  # User-session only: consume dialogs at startup to populate known peers.
+  # Leave false unless a target needs this extra cache warmup.
   load_dialogs_on_start: false
 
   bot:
@@ -24,6 +26,8 @@ migration:
 
   destinations:
     - chat: "@destination_channel_or_-100_id"
+      # Bot writers cannot use t.me/+... or joinchat/... here. Use this
+      # group's -100… ID or a public @username, then run warmup-bot once.
       # Optional forum-topic root message ID for delivery.
       topic_id: null
 

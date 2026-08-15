@@ -49,6 +49,20 @@ class AccountRestrictedError(DeferredJobError):
         )
 
 
+class PeerUnresolvedError(DeferredJobError):
+    """The writer session needs to receive a target-chat update first."""
+
+    def __init__(self, destination: str) -> None:
+        super().__init__(
+            f"Writer has not resolved destination {destination}; run `python main.py warmup-bot` and retry",
+            reason_code="peer_unresolved",
+            # The current process stops immediately, so a short delay prevents
+            # a tight cron loop but lets an operator retry straight after a
+            # successful warmup.
+            retry_after_seconds=1,
+        )
+
+
 class DiskLowError(DeferredJobError):
     def __init__(self, message: str) -> None:
         super().__init__(message, reason_code="disk_low")

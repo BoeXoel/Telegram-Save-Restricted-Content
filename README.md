@@ -39,12 +39,13 @@ The app expands `${NAME}` values in `config.yaml`. Session files, `.env`, the qu
 ## Quick start
 
 1. Set `telegram.user_session` to a private name such as `my_user`, then replace the source, destination, and small test range in `config.yaml`.
-2. If you want bot uploads, put `BOT_TOKEN` in `.env` and make the bot an administrator of the destination. Otherwise set `telegram.bot.enabled: false`.
+2. If you want bot uploads, put `BOT_TOKEN` in `.env` and make the bot an administrator of the destination. For a private destination or a fresh Bot session, run `warmup-bot` once before scanning. Otherwise set `telegram.bot.enabled: false`.
 3. Create the user session interactively. The `--session` value must match `telegram.user_session`.
 4. Scan the small range, inspect the queue, then process it. Verify only after the destination result looks correct.
 
 ```bash
 python main.py login --session my_user
+python main.py warmup-bot  # required once for a Bot that has not met a private target
 python main.py scan
 python main.py stats
 python main.py process
@@ -88,6 +89,22 @@ transfer:
 ```
 
 When a bot uploads, make it an administrator of the destination. The user session is still used to read the source because bots often cannot read old history.
+
+### Bot destination warmup
+
+Telegram keeps peer information separately for each session. A fresh Bot session may know that it is in a private supergroup but still lack the peer information required to address that group by its numeric ID. Before the first Bot upload to such a target, run:
+
+```bash
+python main.py warmup-bot
+```
+
+If a target is not ready, the command tells you to send a command such as `/warmup@your_bot` inside that target group, then waits up to 120 seconds. Use `--warmup-timeout SECONDS` to change that limit. A direct command mention is reliable when the Bot uses Telegram privacy mode; making the Bot an administrator also lets it receive ordinary group messages.
+
+For a supergroup, users and Bots use the same `-100…` ID. Do not remove the `-100` prefix for a Bot. A Bot writer cannot use private `t.me/+…` or `joinchat/…` links as a destination because Telegram does not allow Bots to resolve them. Configure the `-100…` ID or a public `@username` instead. A user writer may still use an invite link where Telegram allows it.
+
+`scan` verifies the account that will actually write before adding any rows, so an unresolved Bot target cannot silently create unusable jobs. Existing queue rows are preserved: if `process` receives `PEER_ID_INVALID`, it records `peer_unresolved`, leaves the job pending without consuming an attempt, stops that run, names the target in the log, and points to `warmup-bot`.
+
+Set `telegram.load_dialogs_on_start: true` only when a user session needs an extra peer-cache warmup. It now consumes that user's dialogs once at startup; it is not a substitute for Bot warmup.
 
 ### Delivery choices
 
@@ -216,6 +233,8 @@ transfer:
 
 WebDAV certificates are verified normally. When the server has enough safe free space, the file is downloaded to `active/`, uploaded remotely, then deleted by default. If the server cannot safely hold it, the tool streams from Telegram directly to the remote. A failed direct stream is retried from the beginning; it is not falsely presented as resumable. Failed remote attempts do not create an unlimited local failed-file cache. A successfully archived source is reused for additional configured Telegram destinations.
 
+This remote path is only for known oversized files. It is not a fallback for an unresolved Bot peer, missing permissions, Telegram risk controls, download timeouts, or ordinary Telegram upload failures.
+
 Process only known oversized candidates when desired:
 
 ```bash
@@ -259,6 +278,9 @@ python main.py --help
 # Create or refresh the interactive user session.
 python main.py login --session my_user
 
+# Make a Bot session learn private destination peers before its first upload.
+python main.py warmup-bot
+
 # Scan the configured ranges into SQLite.
 python main.py scan
 
@@ -283,7 +305,7 @@ python main.py report-oversized --csv oversized.csv
 
 `python bot.py ...` remains a compatibility wrapper for `python main.py ...`; new scripts should use `main.py`.
 
-Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and `skipped`. Extra reason codes distinguish cases such as `oversized`, `unknown_size`, `disk_low`, `disk_full`, `flood_wait`, `account_restricted`, `source_missing`, `permission_denied`, `topic_error`, and `ad_filtered`.
+Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and `skipped`. Extra reason codes distinguish cases such as `oversized`, `unknown_size`, `disk_low`, `disk_full`, `flood_wait`, `account_restricted`, `peer_unresolved`, `source_missing`, `permission_denied`, `telegram_bad_request`, `topic_error`, and `ad_filtered`.
 
 Short FloodWaits are waited out. Longer ones are scheduled for a later run. Account-risk restrictions pause the current run and defer the job; the tool never rotates to another account automatically.
 

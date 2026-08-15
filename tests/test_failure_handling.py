@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from pyrogram.errors import MessageIdInvalid, PeerFlood
+from pyrogram.errors import MessageIdInvalid, PeerIdInvalid, PeerFlood
 
 from app.errors import FloodWaitDeferred
 from app.telegram_client import TelegramLimiter
@@ -49,6 +49,26 @@ class WorkerFailureClassificationTests(unittest.IsolatedAsyncioTestCase):
         await worker._process_one(_job(), _StopEvent())
 
         self.assertEqual(queue.skipped[0]["reason_code"], "source_missing")
+
+    async def test_unresolved_peer_is_deferred_and_stops_with_a_warmup_hint(self) -> None:
+        queue = _RecordingQueue()
+        logger = _RecordingLogger()
+        worker = Worker(
+            _worker_config(),
+            queue,
+            _FailingUploader(PeerIdInvalid("PEER_ID_INVALID")),
+            logger=logger,
+        )
+        stop_event = _StopEvent()
+
+        await worker._process_one(_job(), stop_event)
+
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(queue.deferred["reason_code"], "peer_unresolved")
+        self.assertEqual(queue.deferred["retry_after_seconds"], 1)
+        self.assertEqual(queue.skipped, [])
+        self.assertIn("-1002", logger.errors[0])
+        self.assertIn("warmup-bot", logger.errors[0])
 
     async def test_actual_fallback_writer_replaces_the_initial_writer_metadata(self) -> None:
         queue = _RecordingQueue()
@@ -119,6 +139,20 @@ class _StopEvent:
         return self.stopped
 
 
+class _RecordingLogger:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+
+    def info(self, *_args: object) -> None:
+        return
+
+    def warning(self, *_args: object) -> None:
+        return
+
+    def error(self, message: str, *args: object) -> None:
+        self.errors.append(message % args)
+
+
 def _limiter_config() -> object:
     return SimpleNamespace(
         limits=SimpleNamespace(
@@ -139,7 +173,7 @@ def _worker_config() -> object:
 
 
 def _job() -> object:
-    return SimpleNamespace(id=12)
+    return SimpleNamespace(id=12, dest_chat_id="-1002")
 
 
 if __name__ == "__main__":

@@ -36,10 +36,12 @@ from app.storage import DownloadStorage
 from app.telegram_client import (
     TelegramLimiter,
     WriterCapabilities,
+    is_private_invite_link,
     message_caption,
     message_file_size,
     message_is_empty,
     message_media_type,
+    telegram_chat_id,
 )
 
 
@@ -90,6 +92,13 @@ class Uploader:
         stop_event: asyncio.Event,
         on_phase: PhaseCallback,
     ) -> UploadResult:
+        if self._writer_is_bot() and is_private_invite_link(job.dest_chat_id):
+            raise PermanentJobError(
+                "Bot writers cannot use a private invite link as a destination; "
+                "use the target's -100… ID or public @username",
+                reason_code="bot_invite_link",
+            )
+
         messages = await self._load_source_messages(job)
         filter_match = self._filter_match(messages)
         if filter_match:
@@ -142,7 +151,7 @@ class Uploader:
         result = await self.limiter.call(
             "upload",
             self.writer.send_message,
-            chat_id=job.dest_chat_id,
+            chat_id=self._peer_id(job.dest_chat_id),
             text=text,
             entities=message.entities or message.caption_entities,
             **self._destination_kwargs(job),
@@ -158,7 +167,7 @@ class Uploader:
         result = await self.limiter.call(
             "read",
             self.reader.get_messages,
-            job.source_chat_id,
+            self._peer_id(job.source_chat_id),
             job.source_message_ids,
         )
         if not isinstance(result, list):
@@ -197,8 +206,8 @@ class Uploader:
             result = await self.limiter.call(
                 "copy",
                 self.writer.forward_messages,
-                chat_id=job.dest_chat_id,
-                from_chat_id=job.source_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
+                from_chat_id=self._peer_id(job.source_chat_id),
                 message_ids=[msg.id for msg in messages],
             )
 
@@ -217,8 +226,8 @@ class Uploader:
             result = await self.limiter.call(
                 "copy",
                 self.writer.copy_media_group,
-                chat_id=job.dest_chat_id,
-                from_chat_id=job.source_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
+                from_chat_id=self._peer_id(job.source_chat_id),
                 message_id=first.id,
                 captions="" if self.config.transfer.drop_caption else None,
                 **kwargs,
@@ -227,8 +236,8 @@ class Uploader:
             result = await self.limiter.call(
                 "copy",
                 self.writer.copy_message,
-                chat_id=job.dest_chat_id,
-                from_chat_id=job.source_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
+                from_chat_id=self._peer_id(job.source_chat_id),
                 message_id=first.id,
                 caption="" if self.config.transfer.drop_caption else None,
                 **kwargs,
@@ -528,7 +537,7 @@ class Uploader:
             result = await self.limiter.call(
                 "upload",
                 writer.send_media_group,
-                chat_id=job.dest_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
                 media=media_group,
                 **kwargs,
             )
@@ -547,7 +556,7 @@ class Uploader:
             result = await self.limiter.call(
                 "upload",
                 writer.send_photo,
-                chat_id=job.dest_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
                 photo=str(path),
                 caption=caption,
                 caption_entities=message.caption_entities if caption else None,
@@ -557,7 +566,7 @@ class Uploader:
             result = await self.limiter.call(
                 "upload",
                 writer.send_video,
-                chat_id=job.dest_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
                 video=str(path),
                 caption=caption,
                 caption_entities=message.caption_entities if caption else None,
@@ -568,7 +577,7 @@ class Uploader:
             result = await self.limiter.call(
                 "upload",
                 writer.send_message,
-                chat_id=job.dest_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
                 text=message.text or message.caption or "",
                 entities=message.entities or message.caption_entities,
                 **kwargs,
@@ -577,7 +586,7 @@ class Uploader:
             result = await self.limiter.call(
                 "upload",
                 writer.send_document,
-                chat_id=job.dest_chat_id,
+                chat_id=self._peer_id(job.dest_chat_id),
                 document=str(path),
                 caption=caption,
                 caption_entities=message.caption_entities if caption else None,
@@ -626,7 +635,7 @@ class Uploader:
         if not callable(delete_messages):
             return
         try:
-            await self.limiter.call("copy", delete_messages, job.dest_chat_id, message_ids)
+            await self.limiter.call("copy", delete_messages, self._peer_id(job.dest_chat_id), message_ids)
         except Exception as exc:
             if self.logger:
                 self.logger.warning(
@@ -657,16 +666,18 @@ class Uploader:
         return [random.getrandbits(63) for _ in range(count)]
 
     @staticmethod
-    def _peer_id(value: str) -> int | str:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return value
+    def _peer_id(value: int | str) -> int | str:
+        return telegram_chat_id(value)
 
     def _caption_for(self, message: Message) -> str | None:
         if self.config.transfer.drop_caption:
             return None
         return message.caption or message.text or None
+
+    def _writer_is_bot(self) -> bool:
+        return bool(
+            self.writer_capabilities and self.writer_capabilities.account_type == "bot"
+        )
 
     def _message_should_process(self, message: Message) -> bool:
         media_type = message_media_type(message)
@@ -763,11 +774,12 @@ class Uploader:
             return False
 
         try:
-            chat = await self.limiter.call("resolve", get_chat, job.dest_chat_id)
+            destination = self._peer_id(job.dest_chat_id)
+            chat = await self.limiter.call("resolve", get_chat, destination)
             member = await self.limiter.call(
                 "resolve",
                 get_chat_member,
-                job.dest_chat_id,
+                destination,
                 self.fallback_writer_capabilities.account_id,
             )
         except (BadRequest, ChannelInvalid, ChannelPrivate, ChatWriteForbidden):

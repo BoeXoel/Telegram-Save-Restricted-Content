@@ -130,7 +130,7 @@ class LocalUploadLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.writer_identity, "premium_user:30")
             self.assertEqual(result.upload_limit_bytes, 200)
             self.assertTrue(message.download_called)
-            self.assertEqual(reader.checked_members, [("-1002", 30)])
+            self.assertEqual(reader.checked_members, [(-1002, 30)])
             self.assertEqual(len(reader.sent_photos), 1)
             self.assertFalse((active_dir / "job-7").exists())
 
@@ -161,7 +161,7 @@ class LocalUploadLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.status, "skipped")
             self.assertEqual(result.reason_code, "oversized")
             self.assertFalse(message.download_called)
-            self.assertEqual(reader.checked_members, [("-1002", 30)])
+            self.assertEqual(reader.checked_members, [(-1002, 30)])
             self.assertEqual(reader.sent_photos, [])
 
 
