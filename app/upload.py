@@ -529,6 +529,7 @@ class Uploader:
                             caption=caption,
                             caption_entities=caption_entities,
                             supports_streaming=True,
+                            **self._video_metadata_kwargs(message),
                         )
                     )
                 else:
@@ -571,6 +572,7 @@ class Uploader:
                 caption=caption,
                 caption_entities=message.caption_entities if caption else None,
                 supports_streaming=True,
+                **self._video_metadata_kwargs(message),
                 **kwargs,
             )
         elif media_type == "text":
@@ -673,6 +675,24 @@ class Uploader:
         if self.config.transfer.drop_caption:
             return None
         return message.caption or message.text or None
+
+    @staticmethod
+    def _video_metadata_kwargs(message: Message) -> dict[str, int]:
+        """Keep usable source video metadata without sending placeholder zeros."""
+
+        video = getattr(message, "video", None)
+        if video is None:
+            return {}
+
+        metadata: dict[str, int] = {}
+        for field in ("width", "height", "duration"):
+            try:
+                value = int(getattr(video, field, 0))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                metadata[field] = value
+        return metadata
 
     def _writer_is_bot(self) -> bool:
         return bool(

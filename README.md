@@ -128,6 +128,8 @@ transfer:
 
 Native copy/forward is available only when the same user account reads and writes, and Telegram permits the operation. With `hide_sender: true`, that native path uses copy rather than forward. When a bot writes, or native copy is unavailable, selected media uses the local download-and-upload path unless `native_copy.only` is enabled. `save_to_local` has the same successful-download retention effect as `downloads.keep_completed`; it does not create files for native copies, and remote oversized files follow their separate `delete_local_after` setting.
 
+For locally re-uploaded videos, the tool carries forward the source video's known width, height, and duration so Telegram clients retain the original preview shape. It deliberately does not invent missing values or run a video probe. Messages already sent with missing video metadata must be uploaded again to change their preview.
+
 ### Telegram file-size limits
 
 Local download-and-upload uses the account that actually sends the file:
