@@ -8,6 +8,7 @@ It is deliberately a Telegram migration tool, not a general-purpose cloud sync s
 
 - Text-only messages, photos, videos, documents, and media albums.
 - A media message keeps its caption by default. Set `transfer.drop_caption: true` to remove it.
+- Telegram spoiler overlays are deliberately not retained: media and text are sent without a spoiler mask.
 - `transfer.include.text: false` skips text-only messages but does not remove captions from selected media.
 - Native Telegram copy/forward is tried first whenever the same user account reads and writes. This avoids downloading and does not use local disk space.
 - Optional keyword and regular-expression filters inspect text bodies and media captions. A matching message, or any matching item in an album, skips the whole item.
@@ -155,7 +156,9 @@ transfer:
 
 Native copy/forward is available only when the same user account reads and writes, and Telegram permits the operation. With `hide_sender: true`, that native path uses copy rather than forward. When a bot writes, or native copy is unavailable, selected media uses the local download-and-upload path unless `native_copy.only` is enabled. `save_to_local` has the same successful-download retention effect as `downloads.keep_completed`; it does not create files for native copies, and remote oversized files follow their separate `delete_local_after` setting.
 
-For locally re-uploaded videos, the tool carries forward the source video's known width, height, and duration so Telegram clients retain the original preview shape. It deliberately does not invent missing values or run a video probe. Messages already sent with missing video metadata must be uploaded again to change their preview.
+The tool deliberately removes Telegram spoilers instead of copying them. A source media spoiler, or a spoiler inside text or a retained caption, forces the local resend path so the destination has no spoiler mask; other text formatting is retained. If `native_copy.only: true` prevents that resend, the job is marked skipped with a clear reason instead of silently preserving the mask.
+
+For locally re-uploaded videos, the tool carries forward the source video's known width, height, duration, and streaming flag so Telegram clients retain the original player shape. It also tries to download the source preview thumbnail as a fresh local JPEG and attaches it to video and document uploads. This is best-effort: an absent, invalid, oversized, or failed thumbnail never blocks the media upload, and the tool does not run ffmpeg to invent one. Temporary thumbnails live inside the active job directory and are deleted after both successful and failed Telegram uploads, before completed/failed retention can move the media. Messages already sent without metadata or a preview must be uploaded again to change their appearance.
 
 ### Telegram file-size limits
 
@@ -208,7 +211,7 @@ downloads:
   max_job_bytes: 0
 ```
 
-Before each local download, the program reserves the full known job size plus `min_free_bytes`. It checks again while data arrives. A low-space job is delayed without using up its normal retry count. If the filesystem reports `ENOSPC` or a quota failure, the current `active/job-*` directory is deleted instead of being moved into `failed/`.
+Before each local download, the program reserves the full known job size plus `min_free_bytes`; for a compatible video or document it also reserves its small temporary upload thumbnail. It checks again while data arrives. A low-space job is delayed without using up its normal retry count. If the filesystem reports `ENOSPC` or a quota failure, the current `active/job-*` directory is deleted instead of being moved into `failed/`.
 
 If you explicitly want a small troubleshooting cache, enable both settings below. Only program-created `job-*` directories are pruned, oldest first.
 
@@ -260,7 +263,7 @@ transfer:
       password: "${WEBDAV_PASSWORD}"
 ```
 
-WebDAV certificates are verified normally. When the server has enough safe free space, the file is downloaded to `active/`, uploaded remotely, then deleted by default. If the server cannot safely hold it, the tool streams from Telegram directly to the remote. A failed direct stream is retried from the beginning; it is not falsely presented as resumable. Failed remote attempts do not create an unlimited local failed-file cache. A successfully archived source is reused for additional configured Telegram destinations.
+WebDAV certificates are verified normally. When the server has enough safe free space, the file is downloaded to `active/`, uploaded remotely, then deleted by default. If the server cannot safely hold it, the tool streams from Telegram directly to the remote. A failed direct stream is retried from the beginning; it is not falsely presented as resumable. Failed remote attempts do not create an unlimited local failed-file cache. A successfully archived source is reused for additional configured Telegram destinations. The remote receives only the original source media: Telegram upload thumbnails and local metadata are never created or uploaded on this route.
 
 This remote path is only for known oversized files. It is not a fallback for an unresolved Bot peer, missing permissions, Telegram risk controls, download timeouts, or ordinary Telegram upload failures.
 
@@ -334,7 +337,7 @@ python main.py report-oversized --csv oversized.csv
 
 `python bot.py ...` remains a compatibility wrapper for `python main.py ...`; new scripts should use `main.py`.
 
-Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and `skipped`. Extra reason codes distinguish cases such as `oversized`, `unknown_size`, `disk_low`, `disk_full`, `flood_wait`, `account_restricted`, `peer_unresolved`, `source_missing`, `permission_denied`, `telegram_bad_request`, `topic_error`, and `ad_filtered`.
+Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and `skipped`. Extra reason codes distinguish cases such as `oversized`, `unknown_size`, `disk_low`, `disk_full`, `flood_wait`, `account_restricted`, `peer_unresolved`, `source_missing`, `permission_denied`, `telegram_bad_request`, `topic_error`, `spoiler_removal_requires_reupload`, and `ad_filtered`.
 
 Short FloodWaits are waited out. Longer ones are scheduled for a later run. Account-risk restrictions pause the current run and defer the job; the tool never rotates to another account automatically.
 

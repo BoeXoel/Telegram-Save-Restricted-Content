@@ -62,6 +62,15 @@ class VideoMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["duration"], 30)
         self.assertNotIn("height", sent)
 
+    async def test_source_streaming_flag_is_preserved_when_known(self) -> None:
+        writer = _Writer()
+        uploader = _uploader(writer)
+        message = _VideoMessage(width=1280, height=720, duration=30, supports_streaming=False)
+
+        await uploader._upload_downloaded(_job(), [(message, Path("download.mp4"))], writer=writer)
+
+        self.assertFalse(writer.video_calls[0]["supports_streaming"])
+
 
 class _Writer:
     def __init__(self) -> None:
@@ -78,14 +87,26 @@ class _Writer:
 
 
 class _VideoMessage:
-    def __init__(self, *, width: object, height: object, duration: object) -> None:
+    def __init__(
+        self,
+        *,
+        width: object,
+        height: object,
+        duration: object,
+        supports_streaming: object = None,
+    ) -> None:
         self.id = 1
         self.caption = None
         self.text = None
         self.caption_entities = None
         self.entities = None
         self.media_group_id = None
-        self.video = SimpleNamespace(width=width, height=height, duration=duration)
+        self.video = SimpleNamespace(
+            width=width,
+            height=height,
+            duration=duration,
+            supports_streaming=supports_streaming,
+        )
         self.photo = None
         self.document = None
         self.animation = None

@@ -62,6 +62,65 @@ class RemoteOffloaderTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(offloader.recorded)
             self.assertFalse((active_dir / "job-7-remote").exists())
 
+    async def test_remote_oversized_video_never_downloads_or_archives_a_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_dir = Path(temp_dir) / "active"
+            message = _VideoMediaMessage(101)
+            reader = _StreamingReader([message])
+            offloader = _RecordingOffloader()
+            uploader = Uploader(
+                _uploader_config(active_dir),
+                reader,
+                object(),
+                _Limiter(),
+                writer_capabilities=WriterCapabilities(
+                    identity="bot:10",
+                    account_type="bot",
+                    is_premium=False,
+                    max_upload_bytes=100,
+                ),
+                storage=_LowStorage(),
+                offloader=offloader,  # type: ignore[arg-type]
+            )
+
+            result = await uploader.process(_job(), _NeverSetEvent(), _allowed_phase)
+
+            self.assertEqual(result.transfer_route, "remote")
+            self.assertEqual(reader.thumbnail_download_attempts, [])
+            self.assertEqual(offloader.remote_uris, ["archive:telegram/source/object/1_1.mp4"])
+            self.assertFalse((active_dir / "job-7-remote").exists())
+
+    async def test_spooled_remote_oversized_video_archives_only_the_original_media(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_dir = Path(temp_dir) / "active"
+            message = _VideoMediaMessage(101)
+            reader = _StreamingReader([message])
+            offloader = _RecordingOffloader()
+            uploader = Uploader(
+                _uploader_config(active_dir),
+                reader,
+                object(),
+                _Limiter(),
+                writer_capabilities=WriterCapabilities(
+                    identity="bot:10",
+                    account_type="bot",
+                    is_premium=False,
+                    max_upload_bytes=100,
+                ),
+                storage=_EnoughStorage(),
+                offloader=offloader,  # type: ignore[arg-type]
+            )
+
+            result = await uploader.process(_job(), _NeverSetEvent(), _allowed_phase)
+
+            self.assertEqual(result.transfer_route, "remote")
+            self.assertEqual(reader.thumbnail_download_attempts, [])
+            self.assertEqual(
+                offloader.file_uploads,
+                [("1_1.mp4", "archive:telegram/source/object/1_1.mp4", b"source-video")],
+            )
+            self.assertFalse((active_dir / "job-7-remote").exists())
+
 
 class RemoteObjectDatabaseTests(unittest.TestCase):
     def test_completed_source_is_reused_for_another_destination(self) -> None:
@@ -114,6 +173,8 @@ class _RecordingOffloader:
 
     def __init__(self) -> None:
         self.streamed: list[bytes] = []
+        self.remote_uris: list[str] = []
+        self.file_uploads: list[tuple[str, str, bytes]] = []
         self.recorded = False
 
     def existing_uri(self, _job: object) -> None:
@@ -125,10 +186,14 @@ class _RecordingOffloader:
     def file_uri(self, directory: str, file_name: str) -> str:
         return f"{directory}/{file_name}"
 
-    async def upload_stream(self, chunks: object, _remote_uri: str, *, size: int | None) -> None:
+    async def upload_stream(self, chunks: object, remote_uri: str, *, size: int | None) -> None:
         self.assert_size = size
+        self.remote_uris.append(remote_uri)
         async for chunk in chunks:  # type: ignore[union-attr]
             self.streamed.append(chunk)
+
+    async def upload_file(self, path: Path, remote_uri: str) -> None:
+        self.file_uploads.append((path.name, remote_uri, path.read_bytes()))
 
     def record_completed(self, _job: object, _remote_uri: str) -> None:
         self.recorded = True
@@ -137,6 +202,14 @@ class _RecordingOffloader:
 class _LowStorage:
     def ensure_job_reservation(self, _required_bytes: int) -> None:
         raise DiskLowError("Test disk reserve reached")
+
+
+class _EnoughStorage:
+    def ensure_job_reservation(self, _required_bytes: int) -> None:
+        return
+
+    def ensure_progress_reservation(self, _remaining_bytes: int) -> None:
+        return
 
 
 class _MediaMessage:
@@ -157,16 +230,46 @@ class _MediaMessage:
         self.empty = False
 
 
-class _StreamingReader:
-    def __init__(self, messages: list[_MediaMessage]) -> None:
-        self.messages = messages
+class _VideoMediaMessage(_MediaMessage):
+    def __init__(self, size: int) -> None:
+        super().__init__(size)
+        self.photo = None
+        self.video = SimpleNamespace(
+            file_size=size,
+            file_unique_id="video",
+            file_id="video",
+            width=1920,
+            height=1080,
+            duration=10,
+            supports_streaming=True,
+            thumbs=[SimpleNamespace(file_id="source-preview", width=320, height=180, file_size=10)],
+        )
 
-    async def get_messages(self, _chat_id: str, _message_ids: list[int]) -> list[_MediaMessage]:
+    async def download(self, *, file_name: str, progress: object = None) -> str:
+        path = Path(file_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"source-video"
+        path.write_bytes(payload)
+        if progress is not None:
+            await progress(len(payload), len(payload))  # type: ignore[misc]
+        return str(path)
+
+
+class _StreamingReader:
+    def __init__(self, messages: list[object]) -> None:
+        self.messages = messages
+        self.thumbnail_download_attempts: list[str] = []
+
+    async def get_messages(self, _chat_id: str, _message_ids: list[int]) -> list[object]:
         return self.messages
 
-    async def stream_media(self, _message: _MediaMessage):
+    async def stream_media(self, _message: object):
         yield b"first"
         yield b"second"
+
+    async def download_media(self, file_id: str, **_kwargs: object) -> str:
+        self.thumbnail_download_attempts.append(file_id)
+        raise AssertionError("Remote fallback must not fetch Telegram upload thumbnails")
 
 
 class _Limiter:

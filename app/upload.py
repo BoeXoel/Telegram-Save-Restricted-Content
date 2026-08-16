@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from pyrogram import Client, raw
+from pyrogram import Client, enums, raw
 from pyrogram.errors import (
     BadRequest,
     ChannelInvalid,
@@ -46,6 +46,13 @@ from app.telegram_client import (
 
 
 PhaseCallback = Callable[[str], Awaitable[None]]
+
+
+# Telegram accepts custom upload thumbnails only as small JPEG files.  Keep the
+# values here rather than trusting a source thumbnail blindly: a malformed
+# source thumbnail must never turn a media upload into a disk-space problem.
+MAX_THUMBNAIL_BYTES = 200_000
+MAX_THUMBNAIL_DIMENSION = 320
 
 
 @dataclass(frozen=True)
@@ -118,7 +125,9 @@ class Uploader:
 
         text_only = all(message_media_type(message) == "text" for message in messages)
 
-        if self._should_use_native_copy(job):
+        spoiler_removal_required = self._messages_require_spoiler_removal(messages)
+
+        if self._should_use_native_copy(job) and not spoiler_removal_required:
             try:
                 await on_phase("uploading")
                 return await self._copy_or_forward(job, messages)
@@ -136,6 +145,15 @@ class Uploader:
                     self.logger.warning("Native copy failed for job %s; falling back: %s", job.id, exc)
 
         if self.config.transfer.forwarding_only:
+            if spoiler_removal_required:
+                return UploadResult(
+                    status="skipped",
+                    reason=(
+                        "native_copy.only cannot deliver this message because removing its "
+                        "Telegram spoiler requires a local re-upload"
+                    ),
+                    reason_code="spoiler_removal_requires_reupload",
+                )
             return UploadResult(status="skipped", reason="forwarding_only is enabled and native copy was unavailable")
 
         if text_only:
@@ -148,12 +166,14 @@ class Uploader:
         text = message.text or message.caption or ""
         if not text:
             return UploadResult(status="skipped", reason="Text message was empty")
+        entities, parse_mode = self._visible_entities(message.entities or message.caption_entities)
         result = await self.limiter.call(
             "upload",
             self.writer.send_message,
             chat_id=self._peer_id(job.dest_chat_id),
             text=text,
-            entities=message.entities or message.caption_entities,
+            entities=entities,
+            parse_mode=parse_mode,
             **self._destination_kwargs(job),
         )
         await self._ensure_topic_delivery(job, result)
@@ -311,7 +331,9 @@ class Uploader:
                 return await self._offload_oversized(job, messages, stop_event, on_phase)
             return validation_result
 
-        reservation_bytes = self._job_reservation_bytes(messages)
+        reservation_bytes = self._job_reservation_bytes(messages) + self._thumbnail_reservation_bytes(
+            messages
+        )
         self.storage.ensure_job_reservation(reservation_bytes)
 
         job_dir = self.config.downloads.active_dir / f"job-{job.id}"
@@ -510,97 +532,143 @@ class Uploader:
         writer: Client,
     ) -> UploadResult:
         kwargs = self._destination_kwargs(job)
+        thumbnail_paths: list[Path] = []
+        remaining_thumbnail_bytes = self._thumbnail_reservation_bytes(
+            [message for message, _path in downloaded]
+        )
 
-        if len(downloaded) > 1:
-            media_group = []
-            caption_used = False
-            for message, path in downloaded:
-                caption = self._caption_for(message) if not caption_used else None
-                caption_entities = message.caption_entities if caption else None
-                caption_used = caption_used or bool(caption)
-                media_type = message_media_type(message)
-
-                if media_type == "photo":
-                    media_group.append(InputMediaPhoto(str(path), caption=caption, caption_entities=caption_entities))
-                elif media_type == "video":
-                    media_group.append(
-                        InputMediaVideo(
-                            str(path),
-                            caption=caption,
-                            caption_entities=caption_entities,
-                            supports_streaming=True,
-                            **self._video_metadata_kwargs(message),
-                        )
+        try:
+            if len(downloaded) > 1:
+                media_group = []
+                caption_used = False
+                for message, path in downloaded:
+                    caption = self._caption_for(message) if not caption_used else None
+                    caption_entities, caption_parse_mode = self._caption_formatting(message, caption)
+                    caption_used = caption_used or bool(caption)
+                    media_type = message_media_type(message)
+                    thumbnail_reservation = self._thumbnail_reservation_bytes([message])
+                    thumbnail = await self._prepare_upload_thumbnail(
+                        message,
+                        path,
+                        remaining_bytes=remaining_thumbnail_bytes,
+                        cleanup_paths=thumbnail_paths,
                     )
-                else:
-                    media_group.append(InputMediaDocument(str(path), caption=caption, caption_entities=caption_entities))
+                    remaining_thumbnail_bytes -= thumbnail_reservation
+                    thumbnail_kwargs = {"thumb": str(thumbnail)} if thumbnail is not None else {}
 
-            result = await self.limiter.call(
-                "upload",
-                writer.send_media_group,
-                chat_id=self._peer_id(job.dest_chat_id),
-                media=media_group,
-                **kwargs,
+                    if media_type == "photo":
+                        media_group.append(
+                            InputMediaPhoto(
+                                str(path),
+                                caption=caption,
+                                parse_mode=caption_parse_mode,
+                                caption_entities=caption_entities,
+                            )
+                        )
+                    elif media_type == "video":
+                        media_group.append(
+                            InputMediaVideo(
+                                str(path),
+                                caption=caption,
+                                parse_mode=caption_parse_mode,
+                                caption_entities=caption_entities,
+                                **self._video_metadata_kwargs(message),
+                                **thumbnail_kwargs,
+                            )
+                        )
+                    else:
+                        media_group.append(
+                            InputMediaDocument(
+                                str(path),
+                                caption=caption,
+                                parse_mode=caption_parse_mode,
+                                caption_entities=caption_entities,
+                                **thumbnail_kwargs,
+                            )
+                        )
+
+                result = await self.limiter.call(
+                    "upload",
+                    writer.send_media_group,
+                    chat_id=self._peer_id(job.dest_chat_id),
+                    media=media_group,
+                    **kwargs,
+                )
+                await self._ensure_topic_delivery(job, result, writer=writer)
+                return UploadResult(
+                    status="copied",
+                    dest_message_ids=self._result_message_ids(result),
+                    transfer_route="telegram",
+                )
+
+            message, path = downloaded[0]
+            caption = self._caption_for(message)
+            caption_entities, caption_parse_mode = self._caption_formatting(message, caption)
+            media_type = message_media_type(message)
+            thumbnail = await self._prepare_upload_thumbnail(
+                message,
+                path,
+                remaining_bytes=remaining_thumbnail_bytes,
+                cleanup_paths=thumbnail_paths,
             )
+            thumbnail_kwargs = {"thumb": str(thumbnail)} if thumbnail is not None else {}
+
+            if media_type == "photo":
+                result = await self.limiter.call(
+                    "upload",
+                    writer.send_photo,
+                    chat_id=self._peer_id(job.dest_chat_id),
+                    photo=str(path),
+                    caption=caption,
+                    parse_mode=caption_parse_mode,
+                    caption_entities=caption_entities,
+                    **kwargs,
+                )
+            elif media_type == "video":
+                result = await self.limiter.call(
+                    "upload",
+                    writer.send_video,
+                    chat_id=self._peer_id(job.dest_chat_id),
+                    video=str(path),
+                    caption=caption,
+                    parse_mode=caption_parse_mode,
+                    caption_entities=caption_entities,
+                    **self._video_metadata_kwargs(message),
+                    **thumbnail_kwargs,
+                    **kwargs,
+                )
+            elif media_type == "text":
+                entities, parse_mode = self._visible_entities(message.entities or message.caption_entities)
+                result = await self.limiter.call(
+                    "upload",
+                    writer.send_message,
+                    chat_id=self._peer_id(job.dest_chat_id),
+                    text=message.text or message.caption or "",
+                    entities=entities,
+                    parse_mode=parse_mode,
+                    **kwargs,
+                )
+            else:
+                result = await self.limiter.call(
+                    "upload",
+                    writer.send_document,
+                    chat_id=self._peer_id(job.dest_chat_id),
+                    document=str(path),
+                    caption=caption,
+                    parse_mode=caption_parse_mode,
+                    caption_entities=caption_entities,
+                    **thumbnail_kwargs,
+                    **kwargs,
+                )
+
             await self._ensure_topic_delivery(job, result, writer=writer)
             return UploadResult(
                 status="copied",
                 dest_message_ids=self._result_message_ids(result),
                 transfer_route="telegram",
             )
-
-        message, path = downloaded[0]
-        caption = self._caption_for(message)
-        media_type = message_media_type(message)
-
-        if media_type == "photo":
-            result = await self.limiter.call(
-                "upload",
-                writer.send_photo,
-                chat_id=self._peer_id(job.dest_chat_id),
-                photo=str(path),
-                caption=caption,
-                caption_entities=message.caption_entities if caption else None,
-                **kwargs,
-            )
-        elif media_type == "video":
-            result = await self.limiter.call(
-                "upload",
-                writer.send_video,
-                chat_id=self._peer_id(job.dest_chat_id),
-                video=str(path),
-                caption=caption,
-                caption_entities=message.caption_entities if caption else None,
-                supports_streaming=True,
-                **self._video_metadata_kwargs(message),
-                **kwargs,
-            )
-        elif media_type == "text":
-            result = await self.limiter.call(
-                "upload",
-                writer.send_message,
-                chat_id=self._peer_id(job.dest_chat_id),
-                text=message.text or message.caption or "",
-                entities=message.entities or message.caption_entities,
-                **kwargs,
-            )
-        else:
-            result = await self.limiter.call(
-                "upload",
-                writer.send_document,
-                chat_id=self._peer_id(job.dest_chat_id),
-                document=str(path),
-                caption=caption,
-                caption_entities=message.caption_entities if caption else None,
-                **kwargs,
-            )
-
-        await self._ensure_topic_delivery(job, result, writer=writer)
-        return UploadResult(
-            status="copied",
-            dest_message_ids=self._result_message_ids(result),
-            transfer_route="telegram",
-        )
+        finally:
+            self._delete_prepared_thumbnails(thumbnail_paths)
 
     def _destination_kwargs(self, job: MessageJob) -> dict[str, Any]:
         if job.dest_topic_id:
@@ -677,14 +745,217 @@ class Uploader:
         return message.caption or message.text or None
 
     @staticmethod
-    def _video_metadata_kwargs(message: Message) -> dict[str, int]:
+    def _is_spoiler_entity(entity: Any) -> bool:
+        entity_type = getattr(entity, "type", None)
+        return bool(
+            entity_type == enums.MessageEntityType.SPOILER
+            or getattr(entity_type, "name", "") == "SPOILER"
+            or str(entity_type).lower() in {"spoiler", "messageentitytype.spoiler"}
+        )
+
+    @classmethod
+    def _has_spoiler_entity(cls, entities: Any) -> bool:
+        return any(cls._is_spoiler_entity(entity) for entity in (entities or ()))
+
+    @classmethod
+    def _visible_entities(
+        cls,
+        entities: Any,
+    ) -> tuple[list[Any] | None, enums.ParseMode | None]:
+        """Remove spoiler entities without changing the source text offsets.
+
+        Source text contains no literal spoiler markers, so disabling parse mode
+        when every entity was a spoiler prevents Pyrogram from applying a new
+        formatting interpretation to that plain text.
+        """
+
+        source_entities = list(entities or ())
+        if not source_entities:
+            return None, None
+        visible = [entity for entity in source_entities if not cls._is_spoiler_entity(entity)]
+        if len(visible) == len(source_entities):
+            return visible, None
+        if visible:
+            return visible, None
+        return None, enums.ParseMode.DISABLED
+
+    def _caption_formatting(
+        self,
+        message: Message,
+        caption: str | None,
+    ) -> tuple[list[Any] | None, enums.ParseMode | None]:
+        if not caption:
+            return None, None
+        return self._visible_entities(getattr(message, "caption_entities", None))
+
+    def _messages_require_spoiler_removal(self, messages: list[Message]) -> bool:
+        """Whether a server-side copy would preserve a source spoiler."""
+
+        for message in messages:
+            if bool(getattr(message, "has_media_spoiler", False)):
+                return True
+            entities = getattr(message, "entities", None) or getattr(message, "caption_entities", None)
+            if message_media_type(message) == "text":
+                if self._has_spoiler_entity(entities):
+                    return True
+            elif not self.config.transfer.drop_caption and self._has_spoiler_entity(entities):
+                return True
+        return False
+
+    @staticmethod
+    def _positive_int_or_none(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @classmethod
+    def _thumbnail_candidate(cls, message: Message) -> Any | None:
+        media_type = message_media_type(message)
+        if media_type not in {"video", "document"}:
+            return None
+        media = getattr(message, media_type, None)
+        candidates: list[tuple[int, int, Any]] = []
+        for thumbnail in getattr(media, "thumbs", None) or ():
+            file_id = getattr(thumbnail, "file_id", None)
+            width = cls._positive_int_or_none(getattr(thumbnail, "width", None))
+            height = cls._positive_int_or_none(getattr(thumbnail, "height", None))
+            file_size = cls._positive_int_or_none(getattr(thumbnail, "file_size", None))
+            if not file_id or width is None or height is None:
+                continue
+            if width > MAX_THUMBNAIL_DIMENSION or height > MAX_THUMBNAIL_DIMENSION:
+                continue
+            if file_size is not None and file_size >= MAX_THUMBNAIL_BYTES:
+                continue
+            candidates.append((width * height, file_size or 0, thumbnail))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+
+    @classmethod
+    def _thumbnail_reservation_for_message(cls, message: Message) -> int:
+        thumbnail = cls._thumbnail_candidate(message)
+        if thumbnail is None:
+            return 0
+        file_size = cls._positive_int_or_none(getattr(thumbnail, "file_size", None))
+        return file_size if file_size is not None else MAX_THUMBNAIL_BYTES
+
+    @classmethod
+    def _thumbnail_reservation_bytes(cls, messages: list[Message]) -> int:
+        return sum(cls._thumbnail_reservation_for_message(message) for message in messages)
+
+    async def _prepare_upload_thumbnail(
+        self,
+        message: Message,
+        media_path: Path,
+        *,
+        remaining_bytes: int,
+        cleanup_paths: list[Path],
+    ) -> Path | None:
+        """Download a source preview as a new, temporary Telegram thumbnail.
+
+        Telegram thumbnail file IDs cannot be reused by another upload.  This
+        helper is intentionally called only by the local Telegram upload path;
+        remote oversized fallback transfers the original media and never calls
+        it.
+        """
+
+        thumbnail = self._thumbnail_candidate(message)
+        if thumbnail is None:
+            return None
+
+        target = media_path.parent / f".thumbnail-{message.id}.jpg"
+        complete = False
+        progress_error: DiskFullError | None = None
+
+        async def check_progress(current: int, _total: int) -> None:
+            nonlocal progress_error
+            ensure_progress = getattr(self.storage, "ensure_progress_reservation", None)
+            if not callable(ensure_progress):
+                return
+            remaining = max(0, remaining_bytes - max(0, int(current)))
+            try:
+                ensure_progress(remaining)
+            except DiskFullError as exc:
+                progress_error = exc
+                stop_transmission = getattr(self.reader, "stop_transmission", None)
+                if callable(stop_transmission):
+                    stop_transmission()
+                raise
+
+        try:
+            ensure_progress = getattr(self.storage, "ensure_progress_reservation", None)
+            if callable(ensure_progress):
+                ensure_progress(max(0, remaining_bytes))
+            result = await self.limiter.call(
+                "download",
+                self.reader.download_media,
+                thumbnail.file_id,
+                file_name=str(target),
+                progress=check_progress,
+            )
+            if progress_error is not None:
+                raise progress_error
+
+            downloaded_path = Path(result or target)
+            if downloaded_path.resolve() != target.resolve():
+                self._log_thumbnail_skip(message, "Telegram returned an unexpected local path")
+                return None
+            if not self._is_valid_thumbnail_file(target):
+                self._log_thumbnail_skip(message, "the downloaded file is not a valid upload thumbnail")
+                return None
+            complete = True
+            cleanup_paths.append(target)
+            return target
+        except DiskFullError:
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+                raise DiskFullError("The filesystem ran out of space while downloading a thumbnail") from exc
+            self._log_thumbnail_skip(message, f"thumbnail download failed ({exc.__class__.__name__})")
+            return None
+        except Exception as exc:
+            self._log_thumbnail_skip(message, f"thumbnail download failed ({exc.__class__.__name__})")
+            return None
+        finally:
+            if not complete:
+                self._delete_prepared_thumbnail(target)
+
+    @staticmethod
+    def _is_valid_thumbnail_file(path: Path) -> bool:
+        try:
+            if not path.is_file() or not 0 < path.stat().st_size < MAX_THUMBNAIL_BYTES:
+                return False
+            with path.open("rb") as handle:
+                return handle.read(3) == b"\xff\xd8\xff"
+        except OSError:
+            return False
+
+    def _delete_prepared_thumbnails(self, paths: list[Path]) -> None:
+        for path in paths:
+            self._delete_prepared_thumbnail(path)
+
+    def _delete_prepared_thumbnail(self, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            if self.logger:
+                self.logger.warning("Could not remove temporary upload thumbnail %s: %s", path.name, exc)
+
+    def _log_thumbnail_skip(self, message: Message, reason: str) -> None:
+        if self.logger:
+            self.logger.warning("Skipping thumbnail for source message %s: %s", message.id, reason)
+
+    @staticmethod
+    def _video_metadata_kwargs(message: Message) -> dict[str, int | bool]:
         """Keep usable source video metadata without sending placeholder zeros."""
 
         video = getattr(message, "video", None)
         if video is None:
             return {}
 
-        metadata: dict[str, int] = {}
+        metadata: dict[str, int | bool] = {}
         for field in ("width", "height", "duration"):
             try:
                 value = int(getattr(video, field, 0))
@@ -692,6 +963,10 @@ class Uploader:
                 continue
             if value > 0:
                 metadata[field] = value
+        supports_streaming = getattr(video, "supports_streaming", None)
+        metadata["supports_streaming"] = (
+            supports_streaming if isinstance(supports_streaming, bool) else True
+        )
         return metadata
 
     def _writer_is_bot(self) -> bool:
