@@ -64,6 +64,33 @@ python main.py login --config config.yaml --session my_user
 
 If Telegram requests two-factor authentication, the password prompt is hidden and the password is never written to logs. Login must remain interactive; do not put the password into YAML, `.env`, or a service file.
 
+## Optional Telegram proxy
+
+When the server's direct route to Telegram is unstable, route all Telegram traffic through one trusted proxy. The setting applies uniformly to the Reader, Bot writer, interactive login, Bot peer warmup, and media transfers.
+
+```yaml
+telegram:
+  proxy:
+    enabled: true
+    scheme: "socks5" # socks5 | http
+    hostname: "${TELEGRAM_PROXY_HOST}"
+    port: 1080
+    username: "${TELEGRAM_PROXY_USERNAME:}"
+    password: "${TELEGRAM_PROXY_PASSWORD:}"
+```
+
+Put an authenticated proxy's credentials in `.env`, for example:
+
+```env
+TELEGRAM_PROXY_HOST=proxy.example.net
+TELEGRAM_PROXY_USERNAME=proxy-user
+TELEGRAM_PROXY_PASSWORD=proxy-password
+```
+
+`http` means an HTTP proxy that supports the CONNECT method; it is not a general HTTP forwarding setting. SOCKS5 is usually the simpler option for a Telegram relay. The program logs only the enabled proxy's protocol, host, and port, never its credentials.
+
+When a proxy is enabled, the tool does not silently retry through the server's direct network connection. Fix the proxy or disable `telegram.proxy.enabled` explicitly. This setting only controls Telegram traffic; it does not configure rclone or WebDAV remote-archive traffic. Do not use an untrusted public proxy with a Telegram account session.
+
 ## Configure sources, targets, and message types
 
 Edit `config.yaml` and make the IDs/ranges real:

@@ -77,12 +77,42 @@ class ChatSpec:
 
 
 @dataclass(frozen=True)
+class TelegramProxyConfig:
+    """Optional proxy settings shared by every Telegram client."""
+
+    enabled: bool
+    scheme: str
+    hostname: str
+    port: int
+    username: str
+    password: str
+
+    def as_pyrogram_proxy(self) -> dict[str, str | int] | None:
+        """Return the sanitized Pyrogram proxy shape, or direct mode."""
+
+        if not self.enabled:
+            return None
+
+        proxy: dict[str, str | int] = {
+            "scheme": self.scheme,
+            "hostname": self.hostname,
+            "port": self.port,
+        }
+        if self.username:
+            proxy["username"] = self.username
+        if self.password:
+            proxy["password"] = self.password
+        return proxy
+
+
+@dataclass(frozen=True)
 class TelegramConfig:
     api_id: int
     api_hash: str
     user_session: str
     sessions_dir: Path
     load_dialogs_on_start: bool
+    proxy: TelegramProxyConfig
     bot_enabled: bool
     bot_token: str
     bot_session_name: str
@@ -267,6 +297,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             user_session=str(telegram.get("user_session") or "user"),
             sessions_dir=_path(base_dir, str(telegram.get("sessions_dir", "sessions"))),
             load_dialogs_on_start=_as_bool(telegram.get("load_dialogs_on_start"), False),
+            proxy=_load_telegram_proxy(telegram.get("proxy")),
             bot_enabled=_as_bool((telegram.get("bot") or {}).get("enabled"), False),
             bot_token=str((telegram.get("bot") or {}).get("token") or ""),
             bot_session_name=str((telegram.get("bot") or {}).get("session_name") or "uploader_bot"),
@@ -356,6 +387,37 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         sources=[ChatSpec.from_config(item) for item in migration.get("sources", [])],
         destinations=[ChatSpec.from_config(item) for item in migration.get("destinations", [])],
     )
+
+
+def _load_telegram_proxy(raw: Any) -> TelegramProxyConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("telegram.proxy must be a mapping")
+
+    enabled = _as_bool(raw.get("enabled"), False)
+    scheme = str(raw.get("scheme", "socks5") or "").strip().lower()
+    hostname = str(raw.get("hostname") or "").strip()
+    port = _nonnegative_int(raw.get("port", 1080), "telegram.proxy.port")
+    proxy = TelegramProxyConfig(
+        enabled=enabled,
+        scheme=scheme,
+        hostname=hostname,
+        port=port,
+        username=str(raw.get("username") or ""),
+        password=str(raw.get("password") or ""),
+    )
+
+    if not enabled:
+        return proxy
+    if scheme not in {"socks5", "http"}:
+        raise ValueError("telegram.proxy.scheme must be either 'socks5' or 'http'")
+    if not hostname:
+        raise ValueError("telegram.proxy.hostname is required when the proxy is enabled")
+    if not 1 <= port <= 65535:
+        raise ValueError("telegram.proxy.port must be between 1 and 65535")
+
+    return proxy
 
 
 def _load_content_filters(raw: Any) -> ContentFilterConfig:

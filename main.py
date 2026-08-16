@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -26,6 +27,17 @@ from app.telegram_client import (
 )
 from app.upload import Uploader
 from app.worker import Verifier, Worker
+
+
+def log_telegram_proxy(config: AppConfig, logger: logging.Logger) -> None:
+    proxy = config.telegram.proxy
+    if proxy.enabled:
+        logger.info(
+            "Telegram proxy enabled: scheme=%s hostname=%s port=%s",
+            proxy.scheme,
+            proxy.hostname,
+            proxy.port,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +115,7 @@ async def run_with_clients(config: AppConfig, command: str, *, oversized_only: b
                 removed_failed,
             )
 
+        log_telegram_proxy(config, logger)
         async with AsyncExitStack() as stack:
             reader = make_user_client(config)
             await stack.enter_async_context(reader)
@@ -205,6 +218,7 @@ async def async_main() -> None:
     config.ensure_directories()
 
     if args.command == "login":
+        log_telegram_proxy(config, setup_logging(config.logging))
         await interactive_login(config, args.session)
         return
 
@@ -226,6 +240,7 @@ async def run_bot_warmup(config: AppConfig, timeout_seconds: int) -> None:
         )
 
     logger = setup_logging(config.logging)
+    log_telegram_proxy(config, logger)
     limiter = TelegramLimiter(config, logger)
     bot = make_bot_client(config)
     if bot is None:

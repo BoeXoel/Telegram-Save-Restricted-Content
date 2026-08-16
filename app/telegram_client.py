@@ -171,12 +171,16 @@ def install_stop_handlers(stop_event: asyncio.Event) -> None:
 
 
 def make_user_client(config: AppConfig) -> Client:
-    return Client(
-        name=config.telegram.user_session,
-        api_id=config.telegram.api_id,
-        api_hash=config.telegram.api_hash,
-        workdir=str(config.telegram.sessions_dir),
-    )
+    kwargs: dict[str, Any] = {
+        "name": config.telegram.user_session,
+        "api_id": config.telegram.api_id,
+        "api_hash": config.telegram.api_hash,
+        "workdir": str(config.telegram.sessions_dir),
+    }
+    proxy = config.telegram.proxy.as_pyrogram_proxy()
+    if proxy is not None:
+        kwargs["proxy"] = proxy
+    return Client(**kwargs)
 
 
 def make_bot_client(config: AppConfig) -> Client | None:
@@ -184,13 +188,17 @@ def make_bot_client(config: AppConfig) -> Client | None:
         return None
     if not config.telegram.bot_token:
         raise ValueError("telegram.bot.enabled is true, but telegram.bot.token is empty")
-    return Client(
-        name=config.telegram.bot_session_name,
-        api_id=config.telegram.api_id,
-        api_hash=config.telegram.api_hash,
-        bot_token=config.telegram.bot_token,
-        workdir=str(config.telegram.sessions_dir),
-    )
+    kwargs: dict[str, Any] = {
+        "name": config.telegram.bot_session_name,
+        "api_id": config.telegram.api_id,
+        "api_hash": config.telegram.api_hash,
+        "bot_token": config.telegram.bot_token,
+        "workdir": str(config.telegram.sessions_dir),
+    }
+    proxy = config.telegram.proxy.as_pyrogram_proxy()
+    if proxy is not None:
+        kwargs["proxy"] = proxy
+    return Client(**kwargs)
 
 
 def _accounts_path(config: AppConfig) -> Path:
@@ -228,12 +236,16 @@ async def interactive_login(config: AppConfig, session_name: str | None = None) 
         raise ValueError("Session name cannot be empty")
 
     limiter = TelegramLimiter(config)
-    client = Client(
-        name=session,
-        api_id=config.telegram.api_id,
-        api_hash=config.telegram.api_hash,
-        workdir=str(config.telegram.sessions_dir),
-    )
+    kwargs: dict[str, Any] = {
+        "name": session,
+        "api_id": config.telegram.api_id,
+        "api_hash": config.telegram.api_hash,
+        "workdir": str(config.telegram.sessions_dir),
+    }
+    proxy = config.telegram.proxy.as_pyrogram_proxy()
+    if proxy is not None:
+        kwargs["proxy"] = proxy
+    client = Client(**kwargs)
     await client.connect()
     try:
         phone = input("Phone number with country code: ").strip()

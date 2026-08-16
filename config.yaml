@@ -8,6 +8,18 @@ telegram:
   # Leave false unless a target needs this extra cache warmup.
   load_dialogs_on_start: false
 
+  # Optional unified route for every Telegram connection (Reader, Bot, login,
+  # warmup, uploads, and downloads). Supported schemes: socks5 and http
+  # (HTTP CONNECT only). Leave disabled to use the server's direct connection.
+  # When enabled, a failed proxy never falls back to direct Telegram traffic.
+  proxy:
+    enabled: false
+    scheme: "socks5"
+    hostname: "${TELEGRAM_PROXY_HOST:}"
+    port: 1080
+    username: "${TELEGRAM_PROXY_USERNAME:}"
+    password: "${TELEGRAM_PROXY_PASSWORD:}"
+
   bot:
     enabled: true
     token: "${BOT_TOKEN}"
